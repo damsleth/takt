@@ -554,9 +554,10 @@ def end_job_leftovers(_locks=None):
     if k32.QueryInformationJobObject(wintypes.HANDLE(_JOB), 3, ctypes.byref(pl), ctypes.sizeof(pl), None):
         for pid in pl.Pids[:pl.InList]:
             if pid != os.getpid():
-                h = k32.OpenProcess(0x0001, False, wintypes.DWORD(pid))  # PROCESS_TERMINATE
+                h = k32.OpenProcess(0x00100001, False, wintypes.DWORD(pid))  # TERMINATE | SYNCHRONIZE
                 if h:
                     k32.TerminateProcess(wintypes.HANDLE(h), 1)
+                    k32.WaitForSingleObject(wintypes.HANDLE(h), 5000)  # termination is asynchronous
                     k32.CloseHandle(wintypes.HANDLE(h))
 
 
@@ -732,7 +733,8 @@ def sd_field(s, lo, pad):
 
 
 def render_systemd(job, ctx):
-    """-> (service text, timer text)."""
+    """-> (service text, timer text or None). A job with no schedule and no run_at_load is
+    manual-only: systemd rejects a timer without a trigger, so it gets the service alone."""
     unit = f"takt-{job['id']}"
     argv = " ".join(sd_quote(a) for a in wrapper_argv(ctx, job["id"]))
     service = (f"[Unit]\nDescription=takt job {job['id']}\n\n[Service]\nType=oneshot\n"
@@ -752,7 +754,7 @@ def render_systemd(job, ctx):
     if job["catch_up"] == "run-once":
         timer.append("Persistent=true")
     timer.append(f"Unit={unit}.service\n\n[Install]\nWantedBy=timers.target\n")
-    return service, "\n".join(timer)
+    return service, ("\n".join(timer) if job["schedule"] or job["run_at_load"] else None)
 
 
 TS_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
@@ -844,7 +846,7 @@ def stage(spec, ctx, out: Path, backends):
                 files = {f"{PREFIX}.{j['id']}.plist": render_launchd(j, ctx)}
             elif b == "systemd":
                 svc, tmr = render_systemd(j, ctx)
-                files = {f"takt-{j['id']}.service": svc, f"takt-{j['id']}.timer": tmr}
+                files = {f"takt-{j['id']}.service": svc, **({f"takt-{j['id']}.timer": tmr} if tmr else {})}
             else:
                 files = {f"takt-{j['id']}.xml": render_schtasks(j, ctx)}
             for name, body in files.items():
@@ -860,11 +862,15 @@ def cron_like(body):
     return bool(t) and bool(re.fullmatch(r"@\w+|[\d*][\d*,/-]*", t[0])) and (len(t) >= 6 or t[0].startswith("@"))
 
 
+SHELL_BUILTINS = {"cd", "export", "source", ".", "set", "unset", "ulimit", "umask", "exec", "eval", "alias",
+                  "trap", "pushd", "popd", "shopt", "read", "wait", "exit", "builtin", "command", "local"}
+
+
 def split_steps(cmd):
     """Shell line -> steps, when it is only argv, `;`, `>>` and `2>>`. Anything else raises,
     and the caller keeps the line as one `sh -c` step with the text verbatim: expansion
     ($, `, globs, ~, braces), cron's % and a truncating > change meaning outside a shell."""
-    if re.search(r"[$`*?\[{~\\]", cmd):  # expansion, and any backslash escape (`echo \;`)
+    if re.search(r"[$`*?\[{~\\#]", cmd):  # expansion, backslash escapes (`echo \;`), `abc#def`
         raise ValueError("shell expansion")
     if re.search(r"(^|\s)(['\"]2['\"]\s*|2\s+)>>", cmd):  # `echo 2 >> f`, `echo "2">> f`: the 2 is an argument
         raise ValueError("ambiguous 2 before >>")
@@ -889,6 +895,8 @@ def split_steps(cmd):
             continue
         if not argv and re.match(r"[A-Za-z_]\w*=", t):  # NAME=value cmd: an environment prefix
             raise ValueError("environment assignment")
+        if not argv and t in SHELL_BUILTINS:  # `cd /tmp; cmd`: cd changes the next command's shell
+            raise ValueError(f"shell builtin {t}")
         if t == ";":
             steps.append((argv, out, err))
             argv, out, err = [], None, None
@@ -950,10 +958,11 @@ def import_cron(text):
         if name != base:
             warns.append(f"line {i + 1}: duplicate id {base!r}, renamed {name!r}")
         seen.add(name)
+        cmd = re.sub(r"\s#\s*[\w.-]+\s*$", "", cmd)  # the trailing name comment is not part of the command
         try:
             raw_steps = split_steps(cmd)
         except ValueError:
-            raw_steps = [(["/bin/sh", "-c", re.sub(r"\s#\s*[\w.-]+\s*$", "", cmd)], None, None)]
+            raw_steps = [(["/bin/sh", "-c", cmd], None, None)]
             warns.append(f"{name}: shell operators kept as one sh -c step")
         steps = [{"id": f"step{k + 1}", "command": a, "stdout": o, "stderr": e, "report": None}
                  for k, (a, o, e) in enumerate(raw_steps)]
@@ -993,13 +1002,14 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", l
     uid = _uid()
     # Retire the old schedulers first: run_at_load fires a reseed the moment a new plist is
     # bootstrapped, and it must not meet a still-armed old job on the same Edge dir.
-    new_cron, cron_changed = crontab_text.splitlines(), False
+    new_cron, cron_changed, booted = crontab_text.splitlines(), False, set()
     for j in spec.values():
         for rep in j["replaces"]:
             kind, _, arg = rep.partition(":")
             if kind == "launchd" and be == "launchd":
                 old = agents_dir / f"{arg}.plist"
-                if loaded is None or arg in loaded:
+                if (loaded is None or arg in loaded) and arg not in booted:  # once, if two jobs replace it
+                    booted.add(arg)
                     acts.append(("run" if loaded is not None else "try", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
                 acts.append(("move", old, Path(ctx["state"]) / "retired" / old.name))
             elif kind == "cron":
@@ -1014,7 +1024,7 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", l
         jid = j["id"]
         if be == "launchd":
             p, label = agents_dir / f"{PREFIX}.{jid}.plist", f"gui/{uid}/{PREFIX}.{jid}"
-            if loaded is None or f"{PREFIX}.{jid}" in loaded:  # a reinstall replaces the loaded copy
+            if (loaded is None or f"{PREFIX}.{jid}" in loaded) and f"{PREFIX}.{jid}" not in booted:  # a reinstall
                 acts.append(("run" if loaded is not None else "try", ["launchctl", "bootout", label], None))
             acts.append(("write", p, render_launchd(j, ctx)))
             acts.append(("run", ["launchctl", "enable", label], None))  # clears a `takt disable`
@@ -1022,14 +1032,17 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", l
         elif be == "systemd":
             svc, tmr = render_systemd(j, ctx)
             acts.append(("write", agents_dir / f"takt-{jid}.service", svc.encode()))
-            acts.append(("write", agents_dir / f"takt-{jid}.timer", tmr.encode()))
+            if tmr:
+                acts.append(("write", agents_dir / f"takt-{jid}.timer", tmr.encode()))
         else:
             x = agents_dir / f"takt-{jid}.xml"
             acts.append(("write", x, render_schtasks(j, ctx).encode("utf-16")))  # schtasks wants UTF-16
             acts.append(("run", ["schtasks", "/Create", "/TN", task_name(jid), "/XML", str(x), "/F"], None))
     if be == "systemd":
         acts.append(("run", ["systemctl", "--user", "daemon-reload"], None))
-        for jid in spec:  # restart, so a reinstalled timer takes its new schedule now
+        for jid, j in spec.items():  # restart, so a reinstalled timer takes its new schedule now
+            if not (j["schedule"] or j["run_at_load"]):
+                continue  # manual-only: no timer; `takt start` runs the service
             acts.append(("run", ["systemctl", "--user", "enable", f"takt-{jid}.timer"], None))
             acts.append(("run", ["systemctl", "--user", "restart", f"takt-{jid}.timer"], None))
     return acts
@@ -1053,7 +1066,8 @@ def installed_ids(be, agents_dir: Path, text=None):
         labels = (line.split("\t")[-1] for line in (text or "").splitlines())
         return sorted(ids | {lb[len(PREFIX) + 1:] for lb in labels if lb.startswith(PREFIX + ".")})
     if be == "systemd":
-        return sorted(p.name[5:-6] for p in agents_dir.glob("takt-*.timer"))
+        return sorted({p.name[5:-6] for p in agents_dir.glob("takt-*.timer")}
+                      | {p.name[5:-8] for p in agents_dir.glob("takt-*.service")})  # manual-only: service alone
     text = native_text(be, []) if text is None else text
     return sorted(n for n in (line.strip().partition("|")[0] for line in text.splitlines()) if n)
 
@@ -1073,6 +1087,7 @@ def plan_uninstall(ids, agents_dir: Path, be, nat):
         elif be == "systemd":
             if inst:  # the timer, then a run that is still going (stop kills the service's cgroup)
                 acts.append(("run", ["systemctl", "--user", "disable", "--now", f"takt-{jid}.timer"], None))
+            if inst or (agents_dir / f"takt-{jid}.service").exists():  # also a manual-only job's service
                 acts.append(("run", ["systemctl", "--user", "stop", f"takt-{jid}.service"], None))
             acts += [("rm", agents_dir / f"takt-{jid}.{x}", None) for x in ("timer", "service")]
         else:
@@ -1080,7 +1095,7 @@ def plan_uninstall(ids, agents_dir: Path, be, nat):
                 acts.append(("run", ["schtasks", "/End", "/TN", task_name(jid)], None))
                 acts.append(("run", ["schtasks", "/Delete", "/TN", task_name(jid), "/F"], None))
             acts.append(("rm", agents_dir / f"takt-{jid}.xml", None))
-    if be == "systemd":
+    if be == "systemd" and ids:
         acts.append(("run", ["systemctl", "--user", "daemon-reload"], None))
     return acts
 
@@ -1089,7 +1104,10 @@ def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, 
     """install: retire the takt jobs the spec no longer names, then install the spec.
     uninstall: the given ids, or every job in the spec and every takt job registered here."""
     if cmd == "install":
-        return (plan_uninstall([i for i in known if i not in spec], agents_dir, be, nat)
+        stale = [i for i in known if i not in spec]
+        if loaded is not None:  # retired below: a `replaces` naming one of them must not boot it out again
+            loaded = loaded - {f"{PREFIX}.{i}" for i in stale}
+        return (plan_uninstall(stale, agents_dir, be, nat)
                 + plan_install(spec, ctx, agents_dir, crontab, be, loaded))
     return plan_uninstall(list(ids or sorted(set(spec) | set(known))), agents_dir, be, nat)
 
@@ -1620,7 +1638,9 @@ def self_check():
         check_review2(ok, tmp)
         check_review3(ok, tmp)
         check_review4(ok, tmp)
+        check_review5(ok, tmp)
         check_examples(ok, tmp)
+        check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"{n['ok']} passed, {n['bad']} failed")
@@ -2409,6 +2429,52 @@ def check_review4(ok, tmp):
     # cron import: backslash escapes stay in sh -c
     jobs, _, _ = import_cron("0 1 * * * echo \\;\n0 2 * * * echo \\2>> /tmp/f\n")
     ok([j["steps"][0]["command"][:2] for j in jobs] == [["/bin/sh", "-c"]] * 2, "import: backslash escapes stay in sh -c")
+
+
+def check_review5(ok, tmp):
+    """Regressions for the fifth external review (2026-10-03)."""
+    # a manual-only job: systemd gets the service, no timer, and nothing enables a timer
+    manual = mkjob("m", command=[PY, "-c", "pass"])
+    ok(render_systemd(manual, CTX)[1] is None and render_systemd(mkjob("r", run_at_load=True), CTX)[1] is not None,
+       "systemd: a job with no schedule and no run_at_load gets no timer")
+    ud = tmp / "r5-units"
+    acts = plan_install({"m": manual}, {**CTX, "state": str(tmp / "r5st")}, ud, "", "systemd")
+    ok([Path(a).name for k, a, _ in acts if k == "write"] == ["takt-m.service"]
+       and not [a for k, a, _ in acts if k == "run" and "takt-m.timer" in a],
+       "install systemd: a manual-only job writes the service and enables no timer")
+    apply_plan(acts, lambda a, i: None)
+    ok(installed_ids("systemd", ud) == ["m"], "installed: a manual-only systemd job is found from its service")
+    stops = [a[2:] for k, a, _ in plan_uninstall(["m"], ud, "systemd", {}) if k == "run"]
+    ok(["stop", "takt-m.service"] in stops and not [x for x in stops if "takt-m.timer" in x],
+       "uninstall systemd: a manual-only job's service is stopped, and no timer is touched")
+
+    # one bootout per label: a rename that also `replaces` the old label, and two jobs replacing one label
+    nat = {"old": (True, True)}
+    spec = {"new": mkjob("new", schedule="0 * * * *", replaces=[f"launchd:{PREFIX}.old"])}
+    acts = plan_admin("install", spec, "launchd", tmp / "r5-la", ["old"], nat, ctx={**CTX, "state": str(tmp / "r5st")},
+                      loaded={f"{PREFIX}.old"})
+    ok([a[-1] for k, a, _ in acts if k in ("run", "try") and a[1] == "bootout"] == [f"gui/{_uid()}/{PREFIX}.old"],
+       "install launchd: a label retired as stale is not booted out again by `replaces`")
+    two = {x: mkjob(x, schedule="0 * * * *", replaces=["launchd:com.example.shared"]) for x in ("p", "q")}
+    acts = plan_install(two, {**CTX, "state": str(tmp / "r5st")}, tmp / "r5-la", "", "launchd", {"com.example.shared"})
+    ok(sum(1 for k, a, _ in acts if k in ("run", "try") and a[-1].endswith("com.example.shared")) == 1,
+       "install launchd: two jobs replacing one label boot it out once")
+
+    # cron import: `#` inside a word and shell builtins stay in sh -c; the name comment is dropped
+    jobs, _, _ = import_cron("0 1 * * * /bin/echo abc#def\n0 2 * * * cd /tmp; /bin/pwd\n# nightly\n0 3 * * * /bin/a # nightly\n")
+    cmds = {j["schedule"]: j["steps"][0]["command"] for j in jobs}
+    ok(cmds["0 1 * * *"] == ["/bin/sh", "-c", "/bin/echo abc#def"] and cmds["0 2 * * *"] == ["/bin/sh", "-c", "cd /tmp; /bin/pwd"]
+       and cmds["0 3 * * *"] == ["/bin/a"], "import: `#` in a word and `cd` stay in sh -c; the name comment is not a command")
+
+
+def check_windows_last(ok):
+    """Windows only: end_job_leftovers really ends (and awaits) the other processes in the job.
+    This check process joins a kill-on-close job, so it runs last."""
+    if os.name != "nt" or end_steps_with_wrapper() is not None:
+        return
+    helper = subprocess.Popen([PY, "-c", "import time; time.sleep(30)"], **NO_WINDOW)
+    end_job_leftovers()
+    ok(helper.poll() is not None, "windows: a step's leftover is ended, and awaited, before the locks are released")
 
 
 def check_examples(ok, tmp):
