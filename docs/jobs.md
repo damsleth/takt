@@ -27,7 +27,7 @@ A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `schedule` | none | A cron expression. Without a schedule, the job runs only when you start it. |
+| `schedule` | none | A cron expression. Without a schedule (and without `run_at_load`), the job is manual-only: it runs only when you start it with `takt start` or `takt run`. On systemd it installs as a service with no timer, and `status` shows `SCHED` as `-`. |
 | `command` | | One command as an argv list. A string runs through `/bin/sh -c`. |
 | `stdout`, `stderr` | none | Append the output of the command to these files. `~` is expanded, and a missing directory is created. If a file cannot be opened, the step is `failed` with exit code 127 and a note, and the next steps run. |
 | `step` | | Several commands, as `[[job.<id>.step]]` tables. Use `step` or `command`, not both. |
