@@ -39,7 +39,9 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 
 Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. On systemd, a restart runs a missed slot once (`Persistent=true`). If you removed or renamed a job, `install` first retires the takt job that the scheduler still has under the old id.
 
-`uninstall` stops only the jobs that the scheduler has registered. If the scheduler refuses a stop, takt prints the error, exits with 1 and keeps the files of that job.
+Before `install` and `uninstall` plan anything, takt reads the job list of the scheduler. If it cannot read it (for example, no systemd user bus), the command prints the error, exits with 1 and changes nothing.
+
+`uninstall` stops only the jobs that the scheduler has registered, including a run that is in progress: launchd boots out the job, systemd stops the timer and the service, and Task Scheduler ends the task before it deletes it. If the scheduler refuses a stop, takt prints the error, exits with 1 and keeps the files of that job.
 
 The scheduled command includes the `--spec` and `--state` paths that `install` used, as absolute paths. A job installed with `--state some/dir` keeps its records and locks there.
 
@@ -67,7 +69,8 @@ Both commands only read. Copy the output into your jobs file and edit it.
 `import-cron` splits a line into steps only when the line is plain arguments, `;`, `>>` and `2>>`. These lines become one `/bin/sh -c` step with the text unchanged:
 
 - shell expansion: `$`, backticks, `*`, `?`, `[`, `{`, `~`
-- an environment prefix (`NAME=value cmd`), or `2 >>` with a space (the `2` is an argument)
+- an environment prefix (`NAME=value cmd`), or a `2` before `>>` that is quoted or spaced (`echo "2">> f`, `echo 2 >> f`): the `2` is an argument
+- a quote next to an operator (`echo ";"`), because the quotes make the operator an argument
 - a truncating `>`, pipes and other operators
 
 A line with an unescaped `%` is not imported, because cron sends the text after `%` to the command as input, and a takt job has no input. `import-cron` prints a warning for it. An escaped `\%` becomes `%`. Environment lines such as `PATH=...` and `MAILTO=...` are not imported either. Each one gets a warning, so you can move the values to `[settings] path` or into the commands.
