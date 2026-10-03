@@ -598,9 +598,10 @@ def take_start(state: Path, jid):
 
 
 def job_running(state: Path, jid):
-    """A wrapper for this job is running: it holds the job's own lock (`job-<id>`)."""
+    """A wrapper for this job is running: it holds `run-<id>` from its start, also while it waits
+    for a shared lock (`job-<id>` is taken only with the other locks, after the wait)."""
     try:
-        Locks(state, [f"job-{jid}"], 0).__enter__().__exit__()
+        Locks(state, [f"run-{jid}"], 0).__enter__().__exit__()
         return False
     except TimeoutError:
         return True
@@ -640,9 +641,15 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
     if scheduled and (last := pulled_for(state, jid, slot)):  # before the wait: nothing to do
         say(f"{jid}: already ran for slot {slot:%F %R} (pulled in by {last['pulled_by']})")
         return 0
+    marker = None
     try:
+        # run-<id> first: only this job's own wrapper takes it, and it holds nothing else while it
+        # waits for it, so it cannot deadlock. `takt start` reads it to see a waiting run.
+        marker = Locks(state, [f"run-{jid}"], job["lock_timeout"]).__enter__()
         locks = Locks(state, names, job["lock_timeout"]).__enter__()
     except TimeoutError as e:
+        if marker:
+            marker.__exit__()
         if scheduled and pulled_for(state, jid, slot):  # pulled in while we waited: keep that record
             say(f"{jid}: already ran for slot {slot:%F %R} (pulled in while waiting)")
             return 0
@@ -677,6 +684,7 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
                                blocked_on=locks.blocked_on, pulled=[d for d, _ in order])
     finally:
         locks.__exit__()
+        marker.__exit__()
     return rec_code
 
 
@@ -1299,9 +1307,12 @@ def detail_of(r):
     if r.get("note") and r["status"] in ("skipped", "lock-timeout"):
         detail.append(r["note"])
     for s in r["steps"]:
+        note = f" ({s['note']})" if s.get("note") else ""
         if s["status"] != "ok":
-            detail.append(f"{s['id']}: {s['status']} exit {s['exit']}"
+            detail.append(f"{s['id']}: {s['status']} exit {s['exit']}{note}"
                           + (f" failed sources: {', '.join(s['failed'])}" if s["failed"] else ""))
+        elif note:  # an ok step can still report something (`{"error": "connection refused"}`)
+            detail.append(f"{s['id']}:{note}")
     for p in r.get("preflight", []):
         if not p["ok"] and not p["hard"]:
             detail.append(f"warn {p['need']}: {p['detail']}")
@@ -1349,7 +1360,8 @@ def show(spec, state, jid):
             print(f"  note: {r['note']}")
         for s in r["steps"]:
             print(f"  step {s['id']:14} {s['status']:8} exit {s['exit']}  {s['duration_s']}s"
-                  + (f"  failed: {', '.join(s['failed'])}" if s["failed"] else ""))
+                  + (f"  failed: {', '.join(s['failed'])}" if s["failed"] else "")
+                  + (f"  note: {s['note']}" if s.get("note") else ""))
         for p in r.get("preflight", []):
             print(f"  {'needs' if p['hard'] else 'wants'} {p['need']:12} {'ok' if p['ok'] else 'MISSING'}  {p['detail']}")
     logs = [state / "log" / f"{jid}.log"] + [Path(os.path.expanduser(s[k])) for s in spec[jid]["steps"]
@@ -1684,6 +1696,11 @@ def main(argv=None):
 # ----------------------------------------------------------------------- check
 
 def self_check():
+    # The checks call main(["run", ...]) in this process. On Windows that would put this process in a
+    # kill-on-close job, and the next Locks.__exit__ would end the wrappers the checks spawn. Spawned
+    # wrappers keep containment (their own module), and check_windows_last tests it directly.
+    global CONTAIN
+    CONTAIN = False
     n = {"ok": 0, "bad": 0}
 
     def ok(cond, name):
@@ -1706,6 +1723,7 @@ def self_check():
         check_review5(ok, tmp)
         check_review6(ok, tmp)
         check_review7(ok, tmp)
+        check_review8(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2623,7 +2641,7 @@ def check_review7(ok, tmp):
     specf = write_spec(d, mkjob("d", schedule="0 0 * * *", command=[PY, "-c", "pass"]))
     g, calls = globals(), []
     saved = g["run_admin"]
-    holder = Locks(d / "st", ["job-d"], 5).__enter__()
+    holder = Locks(d / "st", ["run-d"], 5).__enter__()
     try:
         g["run_admin"] = lambda cmds: calls.append(cmds) or None
         out = io.StringIO()
@@ -2634,6 +2652,41 @@ def check_review7(ok, tmp):
     finally:
         holder.__exit__()
         g["run_admin"] = saved
+
+
+def check_review8(ok, tmp):
+    """Regressions for the eighth external review (2026-10-04)."""
+    import contextlib
+    import io
+    # a step note shows in status and in show
+    st = tmp / "r8-notes"
+    write_record(st, {"id": "n", "slot": "2026-10-04T00:00:00", "trigger": "manual", "pulled_by": None,
+                      "started": "2026-10-04T00:00:01", "duration_s": 0.1, "status": "ok", "exit": 0,
+                      "steps": [{"id": "r", "status": "ok", "exit": 0, "duration_s": 0.1, "failed": [],
+                                 "note": "report: connection refused"}], "preflight": []})
+    spec = {"n": mkjob("n", command=[PY, "-c", "pass"])}
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        show(spec, st, "n")
+    ok("connection refused" in status_rows(spec, st, {})[0]["detail"] and "connection refused" in out.getvalue(),
+       "status and show: a step note is visible")
+
+    # a wrapper waiting for a shared lock already counts as running
+    d = tmp / "r8-wait"
+    d.mkdir()
+    specf = write_spec(d, mkjob("j", lock=["res"], command=[PY, "-c", "pass"]))
+    holder = Locks(d / "st", ["res"], 5).__enter__()
+    try:
+        pj = spawn(specf, d / "st", "j")
+        deadline = time.time() + 5
+        while not job_running(d / "st", "j") and time.time() < deadline:
+            time.sleep(0.05)
+        ok(job_running(d / "st", "j") and pj.poll() is None, "start: a run waiting for a shared lock counts as running")
+    finally:
+        holder.__exit__()
+    pj.communicate()
+    ok(not job_running(d / "st", "j") and read_record(d / "st", "j")["status"] == "ok",
+       "start: the marker is released when the run ends")
 
 
 def check_windows_last(ok):
