@@ -1,0 +1,14 @@
+# A Linux host reached as `ssh myvps`. Copy to ~/.config/takt/jobs.myvps.toml.
+# Jobs install as systemd user units. Enable lingering on the host
+# (`loginctl enable-linger $USER`) so they run when you are logged out.
+# Schedules use the host's time zone.
+
+[settings]
+python = "/usr/bin/python3"
+path = "/usr/local/bin:/usr/bin:/bin"
+
+[job.backup]
+schedule = "30 3 * * *"
+lock = ["disk"]
+command = ["/usr/local/bin/backup", "--quiet"]
+stderr = "~/.local/state/takt/backup.err"

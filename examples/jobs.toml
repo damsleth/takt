@@ -1,0 +1,31 @@
+# Two jobs that collide when they run in the same minute: a token refresh that
+# holds a browser profile, and an ingest that reads with those tokens.
+# One shared lock stops the overlap. `after` makes the refresh go first.
+# Copy to ~/.config/takt/jobs.toml and replace the commands.
+
+[settings]
+python = "/opt/homebrew/bin/python3"
+path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+[job.token-refresh]
+schedule = "0 * * * *"            # hourly, minute 0
+run_at_load = true                # also at login
+lock = ["browser-profile"]
+command = ["/usr/local/bin/refresh-tokens"]
+stderr = "~/.local/state/takt/token-refresh.err"
+
+[job.ingest]
+schedule = "0 */2 * * *"          # the same minute as the refresh on even hours
+lock = ["browser-profile"]        # whoever is second waits
+after = ["token-refresh"]         # in a shared slot, the refresh runs first
+wants = ["exe:ingest"]            # warn if missing, run anyway (needs = skip)
+
+[[job.ingest.step]]
+id = "index"
+command = ["/usr/local/bin/ingest", "--reindex"]
+
+[[job.ingest.step]]
+id = "ingest"
+command = ["/usr/local/bin/ingest", "--json"]
+report = "json-failed-sources"    # error.failed_sources in the last JSON line become failed sub-steps
+stdout = "~/.local/state/takt/ingest.log"

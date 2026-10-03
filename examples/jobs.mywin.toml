@@ -1,0 +1,11 @@
+# A Windows host reached as `ssh mywin` (OpenSSH server). Copy to
+# ~/.config/takt/jobs.mywin.toml. Jobs install as Task Scheduler tasks under \takt\.
+# They run while the user is logged on. Pin the interpreter: on Windows `python3`
+# is often the Microsoft Store stub. Use argv lists for commands.
+
+[settings]
+python = 'C:\Users\me\AppData\Local\Programs\Python\Python311\python.exe'
+
+[job.sync]
+schedule = "*/10 * * * *"
+command = ['C:\Windows\System32\wsl.exe', "-d", "Ubuntu", "--", "/home/me/bin/sync.sh"]
