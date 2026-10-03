@@ -1,6 +1,8 @@
 # Commands
 
-takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>`. Commands that change a machine show a plan and stop. Add `--allow-writes` to do the change.
+takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the command. `--state <dir>` sets the state directory the same way.
+
+`install`, `uninstall`, `push`, `start`, `enable` and `disable` change the scheduler or another host. Without `--allow-writes`, they show a plan and stop. `run` executes a job at once, `init` writes a new jobs file, and `render` writes files to a folder.
 
 ## Daily use
 
@@ -35,6 +37,10 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>`. Commands 
 - Linux: writes `~/.config/systemd/user/takt-<id>.{service,timer}`, then runs `daemon-reload` and `enable --now`.
 - Windows: writes the task XML to the state directory and runs `schtasks /Create /TN \takt\<id>`.
 
+Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. On systemd, a restart runs a missed slot once (`Persistent=true`).
+
+The scheduled command includes the `--spec` and `--state` paths that `install` used, so a job installed with `--state /some/dir` keeps its records there.
+
 `install` also retires what a job names in `replaces` (see [jobs.md](jobs.md#replaces)).
 
 ## Other hosts
@@ -55,6 +61,8 @@ See [hosts.md](hosts.md).
 | `takt import-plist <file>` | Reads a LaunchAgent plist and prints it as a job in TOML. |
 
 Both commands only read. Copy the output into your jobs file and edit it.
+
+`import-cron` splits a line into steps only when the line is plain arguments, `;`, `>>` and `2>>`. A line with shell expansion (`$`, backticks, `*`, `?`, `[`, `{`, `~`), cron's `%`, a truncating `>` or other operators becomes one `/bin/sh -c` step with the text unchanged, so it means the same thing.
 
 ## TUI
 

@@ -29,7 +29,7 @@ A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`.
 |---|---|---|
 | `schedule` | none | A cron expression. Without a schedule, the job runs only when you start it. |
 | `command` | | One command as an argv list. A string runs through `/bin/sh -c`. |
-| `stdout`, `stderr` | none | Append the output of the command to these files. `~` is expanded. |
+| `stdout`, `stderr` | none | Append the output of the command to these files. `~` is expanded, and a missing directory is created. If a file cannot be opened, the step is `failed` with exit code 127 and a note, and the next steps run. |
 | `step` | | Several commands, as `[[job.<id>.step]]` tables. Use `step` or `command`, not both. |
 | `lock` | `[]` | Lock names. Two jobs with the same lock name never run at the same time. |
 | `lock_timeout` | `900` | Seconds to wait for a lock. After this, the run ends as `lock-timeout`. |
@@ -69,6 +69,8 @@ Limits:
 - A day of month and a day of week in the same expression are not supported. Cron runs on either day, but launchd and systemd need both.
 - Task Scheduler cannot run every minute inside a range of hours (`* 9-17 * * *`).
 
+A schedule that never matches a date (`0 0 30 2 *`) is an error when takt loads the file. Sparse schedules work: takt searches for slots across 8 years, so a yearly job or a job on 29 February finds its slot.
+
 Schedules use the clock of the host that runs the job.
 
 ## Preflight checks
@@ -86,7 +88,9 @@ Schedules use the clock of the host that runs the job.
 
 ## Ordering with `after`
 
-If `ingest` has `after = ["token-refresh"]`, and both jobs are due in the same slot, the refresh runs first. The ingest runs the refresh itself, under the locks that it holds. When the scheduler starts the refresh a moment later, the refresh sees the record and exits. The refresh runs once, in each order of start. See [design.md](design.md#ordering).
+If `ingest` has `after = ["token-refresh"]`, and both jobs are due in the same slot, the refresh runs first. The ingest runs the refresh itself, under the locks that it holds. When the scheduler starts the refresh a moment later, the refresh sees the record and exits. The refresh runs once, in each order of start. A dependency with `catch_up = "skip"` is not pulled in when its slot is more than 5 minutes old.
+
+The `needs` and `wants` checks of the ingest run after the refresh, so the refresh can make a check pass. See [design.md](design.md#ordering).
 
 ## replaces
 

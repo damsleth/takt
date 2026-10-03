@@ -10,7 +10,8 @@ Include the version (`takt --version`), the OS, and the steps that show the prob
 
 - **The jobs file is code.** Each command in it runs as your user, from your scheduler. Give the jobs files the same protection as your shell profile. Do not install a jobs file that you have not read.
 - **ssh access is host access.** `takt --host <host>` runs commands and copies files with your ssh credentials. takt adds no access of its own and stores no passwords.
-- **Writes need `--allow-writes`.** Without the flag, `install`, `uninstall`, `push`, `start`, `enable` and `disable` print a plan and change nothing.
+- **Changes to the scheduler need `--allow-writes`.** Without the flag, `install`, `uninstall`, `push`, `start`, `enable` and `disable` print a plan and change nothing. `run` executes a job at once, `init` writes a new jobs file, and `render` writes files to a folder.
+- **A host is an ssh alias.** takt refuses a host name that starts with `-` or contains characters outside letters, digits and `. _ @ -`, so a host name cannot become an ssh option.
 - **Arguments to ssh are plain words.** takt refuses an argument that contains characters outside letters, digits and `. / : \ = , @ + - _`, before it starts ssh. This stops shell syntax in a job id or option from running on the host.
 - **No network access of its own.** takt starts `ssh` and `scp`, and the commands in your jobs files. It does not call other services.
 
