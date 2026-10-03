@@ -119,12 +119,45 @@ def matches(f, t: datetime) -> bool:
     return all(v is None or w in v for v, w in zip(f, want))
 
 
-def prev_slot(f, now: datetime, days=32):
+# 29 February is the sparsest date a valid schedule can name. 8 years and a few days cover
+# a skipped leap year (2100), so a slot that exists is always found.
+SEARCH_DAYS = 366 * 8 + 2
+
+
+def _day_ok(f, d):
+    return ((f[2] is None or d.day in f[2]) and (f[3] is None or d.month in f[3])
+            and (f[4] is None or (d.weekday() + 1) % 7 in f[4]))
+
+
+def _times(f):
+    return [(h, m) for h in (f[1] or range(24)) for m in (f[0] or range(60))]
+
+
+def prev_slot(f, now: datetime, days=SEARCH_DAYS):
+    """The latest slot at or before `now`, searched day by day."""
     t = now.replace(second=0, microsecond=0)
-    for _ in range(days * 1440):
-        if matches(f, t):
-            return t
-        t -= timedelta(minutes=1)
+    times = _times(f)[::-1]
+    for i in range(days):
+        d = t - timedelta(days=i)
+        if _day_ok(f, d):
+            for h, m in times:
+                c = d.replace(hour=h, minute=m)
+                if c <= t:
+                    return c
+    return None
+
+
+def next_slot(f, now: datetime, days=SEARCH_DAYS):
+    """The first slot after `now`."""
+    t = now.replace(second=0, microsecond=0)
+    times = _times(f)
+    for i in range(days):
+        d = t + timedelta(days=i)
+        if _day_ok(f, d):
+            for h, m in times:
+                c = d.replace(hour=h, minute=m)
+                if c > t:
+                    return c
     return None
 
 
@@ -156,8 +189,8 @@ def normalize(jid, j) -> dict:
            "wants": list(j.get("wants", [])), "bundle": j.get("bundle"),
            "lock_timeout": int(j.get("lock_timeout", 900)), "replaces": list(j.get("replaces", [])),
            "steps": steps}
-    if job["schedule"]:
-        parse_cron(job["schedule"])
+    if job["schedule"] and next_slot(parse_cron(job["schedule"]), datetime(2000, 1, 1)) is None:
+        raise ValueError(f"job {jid}: schedule {job['schedule']!r} never matches a date")
     if job["catch_up"] not in ("run-once", "skip"):
         raise ValueError(f"job {jid}: catch_up must be run-once or skip")
     return job
@@ -252,9 +285,20 @@ def _trylock(f):
         msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
 
 
+LOCK_FDS = []  # fds of the locks this process holds; each step inherits them (POSIX)
+
+
+def inherit_locks():
+    """subprocess kwargs. A step inherits the lock fds, and flock belongs to the open file, so
+    the lock stays held until the wrapper and the step have both exited. Killing the wrapper
+    alone cannot free a lock that its still-running step uses. ponytail: POSIX only; on Windows
+    the lock ends with the wrapper process."""
+    return {"pass_fds": list(LOCK_FDS)} if fcntl and LOCK_FDS else {}
+
+
 class Locks:
     """Named flocks, taken in sorted order so two jobs can never deadlock.
-    flock dies with the process, so a crashed job cannot wedge the lock."""
+    flock dies with the last process holding it, so a crashed job cannot wedge the lock."""
 
     def __init__(self, state: Path, names, timeout):
         self.dir, self.names, self.timeout, self.fds, self.blocked_on = state / "locks", sorted(names), timeout, [], None
@@ -276,11 +320,14 @@ class Locks:
                         raise TimeoutError(n)
                     time.sleep(0.05)
             self.fds.append(f)
+            LOCK_FDS.append(f.fileno())
         self.waited = round(time.time() - t0, 2)
         return self
 
     def __exit__(self, *a):
         for f in self.fds:
+            if f.fileno() in LOCK_FDS:
+                LOCK_FDS.remove(f.fileno())
             if not fcntl:
                 f.seek(0)
                 msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
@@ -384,17 +431,23 @@ def yaams_failed(out: str):
 
 
 def _open_log(path):
-    return open(os.path.expanduser(path), "ab") if path else None
+    if not path:
+        return None
+    p = Path(os.path.expanduser(path))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return open(p, "ab")
 
 
 def run_step(step):
     t0 = time.time()
     rec = {"id": step["id"], "exit": None, "failed": [], "note": None}
-    out_f, err_f = _open_log(step["stdout"]), _open_log(step["stderr"])
+    out_f = err_f = None
     cap = step["report"] == "json-failed-sources"
     try:
+        out_f = _open_log(step["stdout"])
+        err_f = _open_log(step["stderr"])
         r = subprocess.run(step["command"], stdout=subprocess.PIPE if cap else (out_f or None),
-                           stderr=err_f or None, **NO_WINDOW)
+                           stderr=err_f or None, **NO_WINDOW, **inherit_locks())
         rec["exit"] = r.returncode
         if cap:
             text = r.stdout.decode(errors="replace")
@@ -403,7 +456,7 @@ def run_step(step):
             rec["failed"], code = yaams_failed(text)
             rec["note"] = code
     except OSError as e:
-        rec["exit"], rec["note"] = 127, f"{step['command'][0]}: {e.strerror}"
+        rec["exit"], rec["note"] = 127, f"{e.filename or step['command'][0]}: {e.strerror}"
     finally:
         for f in (out_f, err_f):
             if f:
@@ -431,8 +484,11 @@ def _execute(job, slot, trigger, pulled_by, pre):
 
 
 def slot_of(job, now):
-    f = parse_cron(job["schedule"]) if job["schedule"] else None
-    return (prev_slot(f, now) if f else None) or now.replace(second=0, microsecond=0)
+    """The latest scheduled slot at or before now. normalize() rejects a schedule with no
+    slot, so this is never invented. A job without a schedule uses the current minute."""
+    if not job["schedule"]:
+        return now.replace(second=0, microsecond=0)
+    return prev_slot(parse_cron(job["schedule"]), now)
 
 
 def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=print):
@@ -447,8 +503,8 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
         return 0
     deps = chain_of(spec, jid)
     names = lock_names(spec, jid)
-    pre = preflight(job)
     if dry:
+        pre = preflight(job)
         say(f"{jid} slot {slot:%F %R} trigger {trig}")
         say(f"  locks: {', '.join(sorted(names))}")
         say(f"  after: {', '.join(deps) or '-'} (pulled in only if due this slot and not yet run)")
@@ -462,7 +518,7 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
     except TimeoutError as e:
         rec = {"id": jid, "slot": slot.isoformat(), "trigger": trig, "pulled_by": None,
                "started": datetime.now().isoformat(timespec="seconds"), "duration_s": 0,
-               "status": "lock-timeout", "exit": 75, "steps": [], "preflight": pre,
+               "status": "lock-timeout", "exit": 75, "steps": [], "preflight": preflight(job),
                "note": f"lock {e} held for more than {job['lock_timeout']}s"}
         write_record(state, rec)
         say(f"{jid}: lock-timeout ({rec['note']})")
@@ -480,13 +536,16 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
             # catch-up start dedups instead of running a second time.
             dslot = slot_of(dj, now) if dj["schedule"] else None
             lr = read_record(state, d)
-            if dslot and dslot >= slot and not (lr and lr.get("slot") == dslot.isoformat()):
+            late = dj["catch_up"] == "skip" and dslot and (now - dslot).total_seconds() > SKIP_AFTER
+            if dslot and dslot >= slot and not late and not (lr and lr.get("slot") == dslot.isoformat()):
                 order.append((d, dslot))
         for d, dslot in order:
             code = _run_locked(spec[d], dslot, "pulled", jid, state, say)
             say(f"{jid}: pulled in {d} first (exit {code})")
+        # preflight now, after the locks and the dependencies: a dependency may be what
+        # makes a `needs` check pass (a token refresh before the job that needs the token)
         rec_code = _run_locked(job, slot, trig, None, state, say, waited=locks.waited,
-                               blocked_on=locks.blocked_on, pulled=[d for d, _ in order], pre=pre)
+                               blocked_on=locks.blocked_on, pulled=[d for d, _ in order])
     finally:
         locks.__exit__()
     return rec_code
@@ -517,7 +576,7 @@ def sd_quote(a):
 
 
 def wrapper_argv(ctx, jid):
-    return [ctx["python"], ctx["script"], "run", jid, "--spec", ctx["spec"], "--scheduled"]
+    return [ctx["python"], ctx["script"], "run", jid, "--spec", ctx["spec"], "--state", ctx["state"], "--scheduled"]
 
 
 def launchd_schedule(f):
@@ -597,11 +656,12 @@ def render_systemd(job, ctx):
                f"Environment=PATH={ctx['path']}\nExecStart={argv}\n")
     timer = [f"[Unit]\nDescription=takt timer {job['id']}\n\n[Timer]"]
     if job["schedule"]:
-        f = fields_to_cron(parse_cron(job["schedule"])).split()
+        fl = parse_cron(job["schedule"])
+        f = fields_to_cron(fl).split()
         dow = ""
-        if f[4] != "*":
+        if fl[4] is not None:  # from the expanded list: compress() may have written */2
             names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-            dow = ",".join(names[int(x)] for x in f[4].split(",")) + " "
+            dow = ",".join(names[x] for x in fl[4]) + " "
         timer.append(f"OnCalendar={dow}*-{sd_field(f[3], 1, 1)}-{sd_field(f[2], 1, 1)} "
                      f"{sd_field(f[1], 0, 2)}:{sd_field(f[0], 0, 2)}:00")
     if job["run_at_load"]:
@@ -718,8 +778,11 @@ def cron_like(body):
 
 
 def split_steps(cmd):
-    """Shell line -> steps, when it is only argv, `;`, `>>`/`>` and `2>>`/`2>`.
-    Anything fancier becomes one `sh -c` step with the text kept verbatim."""
+    """Shell line -> steps, when it is only argv, `;`, `>>` and `2>>`. Anything else raises,
+    and the caller keeps the line as one `sh -c` step with the text verbatim: expansion
+    ($, `, globs, ~, braces), cron's % and a truncating > change meaning outside a shell."""
+    if re.search(r"[$`*?\[{~%]", cmd):
+        raise ValueError("shell expansion")
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     toks = list(lex)
@@ -727,7 +790,7 @@ def split_steps(cmd):
     i = 0
     while i < len(toks):
         t = toks[i]
-        if t in (">>", ">"):
+        if t == ">>":  # a takt log appends; `>` would truncate, so it raises below
             if i + 1 >= len(toks):
                 raise ValueError("dangling redirect")
             if argv and argv[-1] == "2":
@@ -836,7 +899,7 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd"):
             kind, _, arg = rep.partition(":")
             if kind == "launchd" and be == "launchd":
                 old = agents_dir / f"{arg}.plist"
-                acts.append(("run", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
+                acts.append(("try", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
                 acts.append(("move", old, Path(ctx["state"]) / "retired" / old.name))
             elif kind == "cron":
                 for k, line in enumerate(new_cron):
@@ -849,8 +912,10 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd"):
     for j in spec.values():
         jid = j["id"]
         if be == "launchd":
-            p = agents_dir / f"{PREFIX}.{jid}.plist"
+            p, label = agents_dir / f"{PREFIX}.{jid}.plist", f"gui/{uid}/{PREFIX}.{jid}"
+            acts.append(("try", ["launchctl", "bootout", label], None))  # a reinstall replaces the loaded copy
             acts.append(("write", p, render_launchd(j, ctx)))
+            acts.append(("run", ["launchctl", "enable", label], None))  # clears a `takt disable`
             acts.append(("run", ["launchctl", "bootstrap", f"gui/{uid}", str(p)], None))
         elif be == "systemd":
             svc, tmr = render_systemd(j, ctx)
@@ -862,8 +927,20 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd"):
             acts.append(("run", ["schtasks", "/Create", "/TN", task_name(jid), "/XML", str(x), "/F"], None))
     if be == "systemd":
         acts.append(("run", ["systemctl", "--user", "daemon-reload"], None))
-        acts += [("run", ["systemctl", "--user", "enable", "--now", f"takt-{jid}.timer"], None) for jid in spec]
+        for jid in spec:  # restart, so a reinstalled timer takes its new schedule now
+            acts.append(("run", ["systemctl", "--user", "enable", f"takt-{jid}.timer"], None))
+            acts.append(("run", ["systemctl", "--user", "restart", f"takt-{jid}.timer"], None))
     return acts
+
+
+def read_crontab(spec, run=subprocess.run):
+    """The crontab, read only when a job has `replaces = ["cron:..."]`."""
+    if not any(r.startswith("cron:") for j in spec.values() for r in j["replaces"]):
+        return ""
+    try:
+        return run(["crontab", "-l"], capture_output=True, text=True).stdout
+    except OSError:
+        sys.exit("a job has replaces = [\"cron:...\"], but crontab is not installed")
 
 
 def plan_uninstall(ids, agents_dir: Path, be):
@@ -893,6 +970,8 @@ def describe(act):
         return f"{kind} {a}"
     if kind == "move":
         return f"move {a} -> {b}"
+    if kind == "try":
+        return "run   " + " ".join(a) + "   (may fail: not loaded)"
     return "run   " + " ".join(a) + (f"   [stdin: {len(b.splitlines())} lines]" if b else "")
 
 
@@ -905,6 +984,11 @@ def apply_plan(acts, runner):
             a.mkdir(parents=True, exist_ok=True)
         elif kind == "rm":
             a.unlink(missing_ok=True)
+        elif kind == "try":
+            try:
+                runner(a, b)
+            except (OSError, subprocess.SubprocessError):
+                pass
         elif kind == "move":
             if a.exists():
                 b.parent.mkdir(parents=True, exist_ok=True)
@@ -970,15 +1054,6 @@ def native_states(spec, be, agents_dir: Path):
         return parse_native(be, r.stdout, list(spec), agents_dir)
     except (OSError, subprocess.SubprocessError):
         return {}
-
-
-def next_slot(f, now: datetime, days=32):
-    t = now.replace(second=0, microsecond=0)
-    for _ in range(days * 1440):
-        t += timedelta(minutes=1)
-        if matches(f, t):
-            return t
-    return None
 
 
 def detail_of(r):
@@ -1054,14 +1129,17 @@ def show(spec, state, jid):
 
 REMOTE_DIR = ".local/share/takt"  # relative to the ssh login dir, the same on sh and pwsh
 SAFE_ARG = re.compile(r"[\w./:\\=,@+-]+")
+HOST_RE = re.compile(r"[A-Za-z0-9][\w.@-]*")  # an ssh alias; a leading - would be an ssh option
 
 
 def hosts():
     """`local` plus every host with a `jobs.<host>.toml` in the config dir."""
-    return ["local"] + sorted(p.name.split(".")[1] for p in CONFIG.glob("jobs.*.toml"))
+    return ["local"] + sorted(h for p in CONFIG.glob("jobs.*.toml") if HOST_RE.fullmatch(h := p.name[5:-5]))
 
 
 def host_settings(host):
+    if not HOST_RE.fullmatch(host):
+        sys.exit(f"bad host {host!r}: use an ssh alias (letters, digits, . _ @ -, no leading -)")
     p = CONFIG / f"jobs.{host}.toml"
     if not p.exists():
         sys.exit(f"no spec for host {host!r}: create {p}")
@@ -1071,6 +1149,8 @@ def host_settings(host):
 def remote_argv(host, args, cfg=None):
     """ssh argv that runs takt on `host` with `args`. The login shell may be sh or pwsh and
     ssh joins with spaces, so nothing is quoted: every token must be a plain word."""
+    if not HOST_RE.fullmatch(host):
+        raise ValueError(f"not an ssh alias: {host!r}")
     cfg = host_settings(host) if cfg is None else cfg
     cmd = [cfg.get("python", "python3"), f"{REMOTE_DIR}/takt.py", *args]
     bad = [x for x in cmd if not SAFE_ARG.fullmatch(x)]
@@ -1309,7 +1389,7 @@ def main(argv=None):
     if a.cmd in ("install", "uninstall"):
         spec = load_spec(a.spec)
         if a.cmd == "install":
-            cron = "" if be == "schtasks" else subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+            cron = read_crontab(spec)
             acts, check = plan_install(spec, make_ctx(a), adir, cron, be), True
         else:
             ids = a.ids or list(spec)
@@ -1343,6 +1423,7 @@ def self_check():
         check_import(ok, tmp)
         check_install(ok, tmp)
         check_admin(ok, tmp)
+        check_review(ok, tmp)
         check_examples(ok, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1390,7 +1471,7 @@ def check_render(ok):
     ok(len(cal) == 12 and cal[0] == {"Hour": 0, "Minute": 0} and cal[-1] == {"Hour": 22, "Minute": 0},
        "launchd 0 */2 -> 12 dicts")
     ok(p["ProgramArguments"] == ["/usr/bin/python3", "/opt/takt/takt.py", "run", "yaams-ingest",
-                                 "--spec", "/opt/takt/jobs.toml", "--scheduled"], "launchd runs through the wrapper")
+                                 "--spec", "/opt/takt/jobs.toml", "--state", "/var/takt", "--scheduled"], "launchd runs through the wrapper, state dir pinned")
     ok(p["EnvironmentVariables"] == {"PATH": "/usr/local/bin:/usr/bin"} and p["Label"] == f"{PREFIX}.yaams-ingest",
        "launchd captures PATH and label")
     q = plistlib.loads(render_launchd(mkjob("q", schedule="*/15 * * * *"), c))
@@ -1403,7 +1484,7 @@ def check_render(ok):
     svc, tmr = render_systemd(yaams, c)
     ok(svc == ("[Unit]\nDescription=takt job yaams-ingest\n\n[Service]\nType=oneshot\n"
                "Environment=PATH=/usr/local/bin:/usr/bin\nExecStart=/usr/bin/python3 /opt/takt/takt.py run "
-               "yaams-ingest --spec /opt/takt/jobs.toml --scheduled\n"), "systemd service golden")
+               "yaams-ingest --spec /opt/takt/jobs.toml --state /var/takt --scheduled\n"), "systemd service golden")
     ok(tmr == ("[Unit]\nDescription=takt timer yaams-ingest\n\n[Timer]\nOnCalendar=*-*-* 00/2:00:00\n"
                "Persistent=true\nUnit=takt-yaams-ingest.service\n\n[Install]\nWantedBy=timers.target\n"),
        "systemd timer golden (0 */2)")
@@ -1455,7 +1536,7 @@ def check_render(ok):
     ok(normalize("yaams-ingest", rt) == yaams, "toml emit -> load round trip")
 
 
-SCHTASKS_GOLDEN = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task" version="1.2">\n  <RegistrationInfo>\n    <Description>takt job q</Description>\n  </RegistrationInfo>\n  <Triggers>\n    <CalendarTrigger>\n      <Repetition>\n        <Interval>PT15M</Interval>\n        <Duration>P1D</Duration>\n        <StopAtDurationEnd>false</StopAtDurationEnd>\n      </Repetition>\n      <StartBoundary>2026-01-01T00:00:00</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByDay>\n        <DaysInterval>1</DaysInterval>\n      </ScheduleByDay>\n    </CalendarTrigger>\n  </Triggers>\n  <Settings>\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n    <StartWhenAvailable>false</StartWhenAvailable>\n    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n  </Settings>\n  <Actions>\n    <Exec>\n      <Command>/usr/bin/python3</Command>\n      <Arguments>/opt/takt/takt.py run q --spec /opt/takt/jobs.toml --scheduled</Arguments>\n    </Exec>\n  </Actions>\n</Task>\n'
+SCHTASKS_GOLDEN = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task" version="1.2">\n  <RegistrationInfo>\n    <Description>takt job q</Description>\n  </RegistrationInfo>\n  <Triggers>\n    <CalendarTrigger>\n      <Repetition>\n        <Interval>PT15M</Interval>\n        <Duration>P1D</Duration>\n        <StopAtDurationEnd>false</StopAtDurationEnd>\n      </Repetition>\n      <StartBoundary>2026-01-01T00:00:00</StartBoundary>\n      <Enabled>true</Enabled>\n      <ScheduleByDay>\n        <DaysInterval>1</DaysInterval>\n      </ScheduleByDay>\n    </CalendarTrigger>\n  </Triggers>\n  <Settings>\n    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n    <StartWhenAvailable>false</StartWhenAvailable>\n    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n  </Settings>\n  <Actions>\n    <Exec>\n      <Command>/usr/bin/python3</Command>\n      <Arguments>/opt/takt/takt.py run q --spec /opt/takt/jobs.toml --state /var/takt --scheduled</Arguments>\n    </Exec>\n  </Actions>\n</Task>\n'
 
 PY = sys.executable
 # One marker file per job name: Windows emulates append as seek-then-write, so two processes
@@ -1696,7 +1777,7 @@ def check_install(ok, tmp):
     apply_plan(acts, lambda a, i: calls.append((a, i)))
     ok((d / "agents" / f"{PREFIX}.new.plist").exists() and not old.exists() and (d / "st/retired/com.example.old.plist").exists(),
        "install: writes new plist, retires the old one aside (not deleted)")
-    ok((d / "st/log").is_dir() and [c[0][:2] for c in calls] == [["launchctl", "bootout"], ["crontab", "-"], ["launchctl", "bootstrap"]],
+    ok((d / "st/log").is_dir() and [c[0][:2] for c in calls] == [["launchctl", "bootout"], ["crontab", "-"], ["launchctl", "bootout"], ["launchctl", "enable"], ["launchctl", "bootstrap"]],
        "install: retire old launchd job and cron line before bootstrapping the new one")
     newcron = calls[1][1].decode()
     ok(calls[1][0] == ["crontab", "-"] and "#takt-migrated# 0 */2 * * * /b/yaams ingest --json" in newcron
@@ -1737,8 +1818,9 @@ def check_admin(ok, tmp):
     apply_plan(acts, lambda a, i: calls.append(a))
     ok("Persistent=true" in (ud / "takt-a.timer").read_text() and (ud / "takt-b.service").exists()
        and calls == [["systemctl", "--user", "daemon-reload"]]
-       + [["systemctl", "--user", "enable", "--now", f"takt-{j}.timer"] for j in "ab"],
-       "install systemd: units written, daemon-reload before enable --now")
+       + [c for j in "ab" for c in (["systemctl", "--user", "enable", f"takt-{j}.timer"],
+                                    ["systemctl", "--user", "restart", f"takt-{j}.timer"])],
+       "install systemd: units written, daemon-reload, then enable and restart (a reinstall takes effect)")
     calls = []
     apply_plan(plan_uninstall(["a"], ud, "systemd"), lambda a, i: calls.append(a))
     ok(calls == [["systemctl", "--user", "disable", "--now", "takt-a.timer"], ["systemctl", "--user", "daemon-reload"]]
@@ -1759,6 +1841,121 @@ def check_admin(ok, tmp):
         ok(False, "remote: refuses a token with shell syntax")
     except ValueError:
         ok(True, "")
+
+
+def check_review(ok, tmp):
+    """Regressions for the first external review (2026-10-03)."""
+    q = lambda *_: None
+    # log paths: a missing directory is made; an unopenable path is a failed step, not a crash
+    d = tmp / "logs"
+    d.mkdir()
+    (d / "afile").write_text("x")
+    mk = d / "m.txt"
+    sp = {"l": mkjob("l", step=[
+        {"id": "newdir", "command": [PY, "-c", "print('hi')"], "stdout": str(d / "new/sub/out.log")},
+        {"id": "bad", "command": [PY, "-c", "pass"], "stdout": str(d / "afile/x.log")},
+        {"id": "after", "command": cmd_mark(mk, "after", 0)}])}
+    code = run_job(sp, "l", d / "st", say=q)
+    r = read_record(d / "st", "l")
+    by = {x["id"]: x for x in r["steps"]} if r else {}
+    ok((d / "new/sub/out.log").read_text().strip() == "hi", "logs: a missing log directory is created")
+    ok(code == 1 and by.get("bad", {}).get("status") == "failed" and by["bad"]["exit"] == 127
+       and "afile" in (by["bad"]["note"] or "") and "after" in marks(mk),
+       "logs: an unopenable log is a failed step with a note, later steps run, the record is written")
+
+    # preflight runs after the dependencies: A makes the file that B needs
+    d = tmp / "prelate"
+    d.mkdir()
+    made = d / "token"
+    sp = {"a": mkjob("a", schedule="0 */2 * * *", command=[PY, "-c", f"open({str(made)!r}, 'w').write('t')"]),
+          "b": mkjob("b", schedule="0 */2 * * *", after=["a"], needs=[f"fda:{made}"], command=[PY, "-c", "pass"])}
+    run_job(sp, "b", d / "st", datetime(2026, 9, 30, 14, 0, 5), scheduled=True, say=q)
+    ok(read_record(d / "st", "b")["status"] == "ok", "preflight: checked after the dependency that satisfies it")
+
+    # a pulled-in dependency keeps its own catch_up = "skip"
+    d = tmp / "depskip"
+    d.mkdir()
+    mk = d / "m.txt"
+    sp = {"a": mkjob("a", schedule="0 * * * *", catch_up="skip", command=cmd_mark(mk, "a", 0)),
+          "b": mkjob("b", schedule="0 */2 * * *", after=["a"], command=cmd_mark(mk, "b", 0))}
+    run_job(sp, "b", d / "st", datetime(2026, 9, 30, 15, 33), scheduled=True, say=q)
+    ok("a" not in marks(mk) and "b" in marks(mk), "after: a late dependency with catch_up=skip is not pulled in")
+
+    # sparse schedules: the real slot, months back; never the current minute
+    yearly = mkjob("y", schedule="0 0 1 1 *", catch_up="skip", command=[PY, "-c", "pass"])
+    ok(slot_of(yearly, datetime(2026, 3, 5, 10, 7)) == datetime(2026, 1, 1)
+       and next_slot(parse_cron("0 0 1 1 *"), datetime(2026, 3, 5)) == datetime(2027, 1, 1),
+       "slots: a yearly job finds its slot 2 months back and its next one 10 months ahead")
+    ok(slot_of(mkjob("f", schedule="0 12 29 2 *"), datetime(2026, 3, 1)) == datetime(2024, 2, 29, 12),
+       "slots: 29 February is found 2 years back")
+    ok(run_job({"y": yearly}, "y", tmp / "yst", datetime(2026, 3, 5, 10, 7), scheduled=True, say=q) == 0
+       and read_record(tmp / "yst", "y") is None, "slots: catch_up=skip drops a yearly job woken months late")
+    try:
+        mkjob("never", schedule="0 0 30 2 *")
+        ok(False, "spec: a schedule with no date (30 February) is rejected")
+    except ValueError:
+        ok(True, "")
+
+    # systemd weekday steps render from the expanded field
+    ok("OnCalendar=Sun,Tue,Thu,Sat *-*-* 00:00:00" in render_systemd(mkjob("w", schedule="0 0 * * */2"), CTX)[1],
+       "systemd: */2 in the weekday field renders as day names")
+
+    # cron import keeps shell meaning
+    jobs, _, _ = import_cron('0 1 * * * echo "$HOME" > /tmp/out\n0 2 * * * ~/bin/x\n0 3 * * * /bin/a >> /tmp/log\n'
+                             '0 4 * * * /bin/a > /tmp/out\n')
+    cmds = [j["steps"][0]["command"] for j in jobs]
+    ok(cmds[0] == ["/bin/sh", "-c", 'echo "$HOME" > /tmp/out'] and cmds[1][:2] == ["/bin/sh", "-c"]
+       and cmds[2] == ["/bin/a"] and jobs[2]["steps"][0]["stdout"] == "/tmp/log"
+       and cmds[3] == ["/bin/sh", "-c", "/bin/a > /tmp/out"],
+       "import: $, ~ and a truncating > stay in sh -c; plain argv with >> is still split")
+
+    # launchd reinstall: unload the old copy (may fail), clear a disable, then bootstrap
+    acts = plan_install({"n": mkjob("n", schedule="0 * * * *")}, {**CTX, "state": str(tmp / "ri")}, tmp / "ri-agents", "")
+    runs = [(k, a[1]) for k, a, _ in acts if k in ("run", "try")]
+    ok(runs == [("try", "bootout"), ("run", "enable"), ("run", "bootstrap")], "install launchd: reinstall boots out the loaded copy")
+    calls = []
+
+    def flaky(a, i):
+        calls.append(a[1])
+        if a[1] == "bootout":
+            raise subprocess.CalledProcessError(5, a)
+    apply_plan(acts, flaky)
+    ok(calls == ["bootout", "enable", "bootstrap"], "install launchd: a failed bootout (not loaded) does not stop the install")
+
+    # crontab is read only when a job replaces a cron line
+    def no_crontab(*a, **k):
+        raise FileNotFoundError("crontab")
+    ok(read_crontab({"x": mkjob("x")}, no_crontab) == "", "install: no crontab needed without cron replaces")
+    try:
+        read_crontab({"x": mkjob("x", replaces=["cron:foo"])}, no_crontab)
+        ok(False, "install: cron replaces without crontab is a clear error")
+    except SystemExit as e:
+        ok("crontab is not installed" in str(e), "install: cron replaces without crontab is a clear error")
+
+    # ssh: a host is never an option
+    for bad in ("-oProxyCommand=x", "-l"):
+        try:
+            remote_argv(bad, ["status"], {})
+            ok(False, f"remote: refuses host {bad}")
+        except ValueError:
+            ok(True, "")
+
+    # a killed wrapper does not free a lock its running step still uses (POSIX: inherited fds)
+    if fcntl:
+        d = tmp / "orphan"
+        d.mkdir()
+        mk = d / "m.txt"
+        spec = write_spec(d, mkjob("a", lock=["res"], command=cmd_mark(mk, "a", 1.5)),
+                          mkjob("b", lock=["res"], command=cmd_mark(mk, "b", 0)))
+        pa = spawn(spec, d / "st", "a")
+        time.sleep(0.5)
+        pa.kill()  # the wrapper only; its step keeps running
+        pa.wait()  # not communicate(): the orphaned step still holds the stdout pipe
+        pa.stdout.close()
+        spawn(spec, d / "st", "b").communicate()
+        ev = marks(mk)
+        ok("end" in ev.get("a", {}) and ev["b"]["start"] >= ev["a"]["end"],
+           "lock: a killed wrapper's still-running step keeps the lock")
 
 
 def check_examples(ok, tmp):
