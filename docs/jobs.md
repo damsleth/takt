@@ -57,7 +57,7 @@ stdout = "~/.local/state/takt/ingest.log"
 
 Steps run in order. A failed step does not stop the next step. Each step has `id`, `command`, `stdout`, `stderr` and `report`.
 
-`report = "json-failed-sources"` reads the last JSON line of the step output. If `error.failed_sources` holds names, the step is `partial` and the names show in the status, also when the step exits with 0.
+`report = "json-failed-sources"` reads the last JSON line of the step output. If `error.failed_sources` holds names, the step is `partial` and the names show in the status, also when the step exits with 0. If `error` is not an object (`{"error": "connection refused"}`), its text becomes the note of the step.
 
 ## Schedules
 
@@ -68,6 +68,7 @@ Limits:
 - Month names and day names (`JAN`, `MON`) are not supported.
 - A day of month and a day of week in the same expression are not supported. Cron runs on either day, but launchd and systemd need both.
 - Task Scheduler cannot run every minute inside a range of hours (`* 9-17 * * *`).
+- Task Scheduler takes at most 48 triggers per task. takt writes one trigger for each time of day, unless the minutes repeat evenly across all hours (`*/15 * * * *` is 1 trigger). `*/5 9-17 * * 1-5` needs 108, so `install` refuses it on Windows before it changes anything. Use fewer times, or split the job.
 
 A schedule that never matches a date (`0 0 30 2 *`) is an error when takt loads the file. Sparse schedules work: takt searches for slots across 8 years, so a yearly job or a job on 29 February finds its slot.
 
