@@ -288,6 +288,7 @@ def _trylock(f):
 
 
 LOCK_FDS = []  # fds of the locks this process holds; each step inherits them (POSIX)
+CONTAIN = os.name == "nt"  # Windows: run steps in a job object (end_steps_with_wrapper)
 
 
 def inherit_locks():
@@ -327,6 +328,9 @@ class Locks:
         return self
 
     def __exit__(self, *a):
+        if self.fds:
+            for hook in BEFORE_UNLOCK:  # Windows: end the job's leftovers first
+                hook(self)
         for f in self.fds:
             if f.fileno() in LOCK_FDS:
                 LOCK_FDS.remove(f.fileno())
@@ -527,8 +531,36 @@ def end_steps_with_wrapper():
     if job and k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)) \
             and k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
         _JOB = job  # kept open for the life of the process
-        return True
-    return False
+        return None
+    err = ctypes.get_last_error()
+    if job:
+        k32.CloseHandle(wintypes.HANDLE(job))
+    return f"Windows error {err}"
+
+
+def end_job_leftovers(_locks=None):
+    """Windows: end every other process in this wrapper's job (a background helper that a step
+    left running) before the locks are released, so none of them runs without the lock."""
+    if _JOB is None:
+        return
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+
+    class PidList(ctypes.Structure):
+        _fields_ = [("Assigned", wintypes.DWORD), ("InList", wintypes.DWORD), ("Pids", ctypes.c_size_t * 4096)]
+    pl = PidList()
+    if k32.QueryInformationJobObject(wintypes.HANDLE(_JOB), 3, ctypes.byref(pl), ctypes.sizeof(pl), None):
+        for pid in pl.Pids[:pl.InList]:
+            if pid != os.getpid():
+                h = k32.OpenProcess(0x0001, False, wintypes.DWORD(pid))  # PROCESS_TERMINATE
+                if h:
+                    k32.TerminateProcess(wintypes.HANDLE(h), 1)
+                    k32.CloseHandle(wintypes.HANDLE(h))
+
+
+BEFORE_UNLOCK = [end_job_leftovers]  # run while the locks are still held
 
 
 def pulled_for(state: Path, jid, slot):
@@ -832,7 +864,7 @@ def split_steps(cmd):
     """Shell line -> steps, when it is only argv, `;`, `>>` and `2>>`. Anything else raises,
     and the caller keeps the line as one `sh -c` step with the text verbatim: expansion
     ($, `, globs, ~, braces), cron's % and a truncating > change meaning outside a shell."""
-    if re.search(r"[$`*?\[{~]", cmd):
+    if re.search(r"[$`*?\[{~\\]", cmd):  # expansion, and any backslash escape (`echo \;`)
         raise ValueError("shell expansion")
     if re.search(r"(^|\s)(['\"]2['\"]\s*|2\s+)>>", cmd):  # `echo 2 >> f`, `echo "2">> f`: the 2 is an argument
         raise ValueError("ambiguous 2 before >>")
@@ -953,8 +985,10 @@ def default_dir(be, state: Path) -> Path:
             "systemd": Path.home() / ".config/systemd/user"}.get(be, state / "schtasks")
 
 
-def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd"):
-    """Ordered actions. Nothing here touches the machine."""
+def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", loaded=None):
+    """Ordered actions. Nothing here touches the machine. `loaded` is the set of launchd labels
+    the scheduler has loaded (from inventory): a loaded job must boot out, and a failure stops
+    the plan before its plist is moved or written. None (no inventory) tolerates the bootout."""
     acts = [("mkdir", Path(ctx["state"]) / "log", None)]  # launchd will not create a log dir
     uid = _uid()
     # Retire the old schedulers first: run_at_load fires a reseed the moment a new plist is
@@ -965,7 +999,8 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd"):
             kind, _, arg = rep.partition(":")
             if kind == "launchd" and be == "launchd":
                 old = agents_dir / f"{arg}.plist"
-                acts.append(("try", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
+                if loaded is None or arg in loaded:
+                    acts.append(("run" if loaded is not None else "try", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
                 acts.append(("move", old, Path(ctx["state"]) / "retired" / old.name))
             elif kind == "cron":
                 for k, line in enumerate(new_cron):
@@ -979,7 +1014,8 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd"):
         jid = j["id"]
         if be == "launchd":
             p, label = agents_dir / f"{PREFIX}.{jid}.plist", f"gui/{uid}/{PREFIX}.{jid}"
-            acts.append(("try", ["launchctl", "bootout", label], None))  # a reinstall replaces the loaded copy
+            if loaded is None or f"{PREFIX}.{jid}" in loaded:  # a reinstall replaces the loaded copy
+                acts.append(("run" if loaded is not None else "try", ["launchctl", "bootout", label], None))
             acts.append(("write", p, render_launchd(j, ctx)))
             acts.append(("run", ["launchctl", "enable", label], None))  # clears a `takt disable`
             acts.append(("run", ["launchctl", "bootstrap", f"gui/{uid}", str(p)], None))
@@ -1012,8 +1048,10 @@ def read_crontab(spec, run=subprocess.run):
 def installed_ids(be, agents_dir: Path, text=None):
     """Every job takt has registered here, from the scheduler's files (launchd, systemd) or
     its task list (schtasks), whether or not the spec still names it."""
-    if be == "launchd":
-        return sorted(p.name[len(PREFIX) + 1:-6] for p in agents_dir.glob(f"{PREFIX}.*.plist"))
+    if be == "launchd":  # plists on disk, plus loaded labels whose plist is gone
+        ids = {p.name[len(PREFIX) + 1:-6] for p in agents_dir.glob(f"{PREFIX}.*.plist")}
+        labels = (line.split("\t")[-1] for line in (text or "").splitlines())
+        return sorted(ids | {lb[len(PREFIX) + 1:] for lb in labels if lb.startswith(PREFIX + ".")})
     if be == "systemd":
         return sorted(p.name[5:-6] for p in agents_dir.glob("takt-*.timer"))
     text = native_text(be, []) if text is None else text
@@ -1047,12 +1085,12 @@ def plan_uninstall(ids, agents_dir: Path, be, nat):
     return acts
 
 
-def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab=""):
+def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab="", loaded=None):
     """install: retire the takt jobs the spec no longer names, then install the spec.
     uninstall: the given ids, or every job in the spec and every takt job registered here."""
     if cmd == "install":
         return (plan_uninstall([i for i in known if i not in spec], agents_dir, be, nat)
-                + plan_install(spec, ctx, agents_dir, crontab, be))
+                + plan_install(spec, ctx, agents_dir, crontab, be, loaded))
     return plan_uninstall(list(ids or sorted(set(spec) | set(known))), agents_dir, be, nat)
 
 
@@ -1162,11 +1200,16 @@ def native_text(be, ids, strict=False, run=subprocess.run):
     return r.stdout
 
 
-def inventory(spec, be, agents_dir: Path, run=subprocess.run):
-    """(takt ids registered here, scheduler state) for install and uninstall. Strict."""
-    known = installed_ids(be, agents_dir, native_text(be, [], True, run) if be == "schtasks" else None)
-    ids = sorted(set(spec) | set(known))
-    return known, parse_native(be, native_text(be, ids, True, run), ids, agents_dir)
+def inventory(spec, be, agents_dir: Path, run=subprocess.run, extra=()):
+    """(takt ids registered here, scheduler state, loaded launchd labels) for install and
+    uninstall. Strict. `extra`: ids named on the command line, looked up even when nothing
+    else knows them."""
+    listing = native_text(be, [], True, run) if be in ("launchd", "schtasks") else None  # full lists
+    known = installed_ids(be, agents_dir, listing)
+    ids = sorted(set(spec) | set(known) | set(extra))
+    text = listing if listing is not None else native_text(be, ids, True, run)
+    loaded = {line.split("\t")[-1] for line in text.splitlines()} if be == "launchd" else set()
+    return known, parse_native(be, text, ids, agents_dir), loaded
 
 
 def run_checked(argv, inp):
@@ -1463,8 +1506,15 @@ def main(argv=None):
         if a.id not in spec:
             sys.exit(f"unknown job {a.id!r}; have: {', '.join(spec)}")
         now = datetime.fromisoformat(a.now) if a.now else None
-        if os.name == "nt" and not a.dry_run:
-            end_steps_with_wrapper()
+        if CONTAIN and not a.dry_run and (err := end_steps_with_wrapper()):
+            # without the job object, /End or a killed wrapper would leave steps running unlocked
+            note = f"not run: cannot put the steps in a Windows job object ({err})"
+            write_record(state_dir(a), {"id": a.id, "slot": slot_of(spec[a.id], now or datetime.now()).isoformat(),
+                                        "trigger": "scheduled" if a.scheduled else "manual", "pulled_by": None,
+                                        "started": datetime.now().isoformat(timespec="seconds"), "duration_s": 0,
+                                        "status": "skipped", "exit": 2, "steps": [], "preflight": [], "note": note})
+            print(f"{a.id}: {note}", file=sys.stderr)
+            return 2
         return run_job(spec, a.id, state_dir(a), now, a.scheduled, a.dry_run)
     be = backend()
     adir = Path(getattr(a, "agents_dir", None) or default_dir(be, state_dir(a)))
@@ -1525,13 +1575,13 @@ def main(argv=None):
     if a.cmd in ("install", "uninstall"):
         spec = load_spec(a.spec)
         try:
-            known, nat = inventory(spec, be, adir)
+            known, nat, loaded = inventory(spec, be, adir, extra=getattr(a, "ids", None) or ())
         except RuntimeError as e:
             print(f"failed: {e}. Nothing changed.", file=sys.stderr)
             return 1
         acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
                           ctx=make_ctx(a) if a.cmd == "install" else None,
-                          crontab=read_crontab(spec) if a.cmd == "install" else "")
+                          crontab=read_crontab(spec) if a.cmd == "install" else "", loaded=loaded)
         for x in acts:
             print(("DO   " if a.allow_writes else "PLAN ") + describe(x))
         if not a.allow_writes:
@@ -1569,6 +1619,7 @@ def self_check():
         check_review(ok, tmp)
         check_review2(ok, tmp)
         check_review3(ok, tmp)
+        check_review4(ok, tmp)
         check_examples(ok, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -2283,6 +2334,81 @@ def check_review3(ok, tmp):
         ok(code == 0 and pushed == ["h3"], "remote: a valid push passes the local parse and pushes")
     finally:
         g["CONFIG"], g["push"] = saved
+
+
+def check_review4(ok, tmp):
+    """Regressions for the fourth external review (2026-10-03)."""
+    import contextlib
+    import io
+    g = globals()
+    # launchd install: a loaded job must boot out first, and a refusal stops before any write
+    la, ctx = tmp / "r4-la", {**CTX, "state": str(tmp / "r4-st")}
+    spec = {"n": mkjob("n", schedule="0 * * * *", replaces=["launchd:com.example.old"])}
+    loaded_all = {f"{PREFIX}.n", "com.example.old"}
+    acts = plan_install(spec, ctx, la, "", "launchd", loaded_all)
+    boots = [(k, a[-1].rsplit("/", 1)[-1]) for k, a, _ in acts if k in ("run", "try") and a[1] == "bootout"]
+    ok(boots == [("run", "com.example.old"), ("run", f"{PREFIX}.n")], "install launchd: a loaded job's bootout must succeed")
+    acts0 = plan_install(spec, ctx, la, "", "launchd", set())
+    ok(not [a for k, a, _ in acts0 if k in ("run", "try") and a[1] == "bootout"],
+       "install launchd: a job that is not loaded is not booted out")
+
+    def refuse(a, i):
+        if a[1] == "bootout":
+            raise subprocess.CalledProcessError(5, a)
+    try:
+        apply_plan(acts, refuse)
+        ok(False, "install launchd: a refused bootout stops before the plist is moved or written")
+    except subprocess.CalledProcessError:
+        ok(not (la / f"{PREFIX}.n.plist").exists() and not (tmp / "r4-st/retired").exists(),
+           "install launchd: a refused bootout stops before the plist is moved or written")
+
+    # inventory: a loaded takt label with no plist, and an id named on the command line
+    def listing(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, f"PID\tStatus\tLabel\n-\t0\t{PREFIX}.ghost\n-\t0\tcom.other\n", "")
+    known, nat, loaded = inventory({}, "launchd", tmp / "r4-empty", listing, extra=["named"])
+    ok(known == ["ghost"] and nat["ghost"] == (False, True) and "named" in nat and f"{PREFIX}.ghost" in loaded,
+       "inventory: finds a loaded takt job with no plist, and looks up named ids")
+    un = plan_admin("uninstall", {}, "launchd", tmp / "r4-empty", known, nat, ids=["ghost"])
+    ok([a[1] for k, a, _ in un if k == "run"] == ["bootout"], "uninstall: boots out a loaded job whose plist is gone")
+
+    # Windows containment: without the job object, the job does not run, and the record says why
+    d = tmp / "r4-contain"
+    d.mkdir()
+    mk = d / "m.txt"
+    specf = write_spec(d, mkjob("c", command=cmd_mark(mk, "c", 0)))
+    saved = g["CONTAIN"], g["end_steps_with_wrapper"]
+    g["CONTAIN"], g["end_steps_with_wrapper"] = True, (lambda: "Windows error 5")
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = main(["run", "c", "--spec", str(specf), "--state", str(d / "st")])
+    finally:
+        g["CONTAIN"], g["end_steps_with_wrapper"] = saved
+    r = read_record(d / "st", "c")
+    ok(code == 2 and "c" not in marks(mk) and r["status"] == "skipped" and "job object" in r["note"],
+       "windows: no job object means no run, and the record says why")
+
+    # leftovers are ended while the locks are still held
+    held = []
+
+    def probe(locks):
+        f = open(locks.dir / "r4.lock", "a+")
+        try:
+            _trylock(f)
+            held.append(False)
+        except OSError:
+            held.append(True)
+        finally:
+            f.close()
+    g["BEFORE_UNLOCK"].append(probe)
+    try:
+        Locks(tmp / "r4-locks", ["r4"], 5).__enter__().__exit__()
+    finally:
+        g["BEFORE_UNLOCK"].remove(probe)
+    ok(held == [True], "lock: leftovers are ended before the locks are released")
+
+    # cron import: backslash escapes stay in sh -c
+    jobs, _, _ = import_cron("0 1 * * * echo \\;\n0 2 * * * echo \\2>> /tmp/f\n")
+    ok([j["steps"][0]["command"][:2] for j in jobs] == [["/bin/sh", "-c"]] * 2, "import: backslash escapes stay in sh -c")
 
 
 def check_examples(ok, tmp):
