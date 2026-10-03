@@ -1,0 +1,100 @@
+# Commands
+
+takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>`. Commands that change a machine show a plan and stop. Add `--allow-writes` to do the change.
+
+## Daily use
+
+| Command | What it does |
+|---|---|
+| `takt` | Opens the TUI. The same as `takt ui`. |
+| `takt status` | Shows the scheduler state, the last run and the next slot of every job. |
+| `takt status -A` | The same for this machine and every host in `~/.config/takt/`. Hosts run in parallel. |
+| `takt status --json` | The same rows as JSON, for other tools. |
+| `takt show <id>` | Shows the last record of a job: steps, exit codes, preflight, and the end of its logs. |
+| `takt start <id>` | Starts the job now, through the scheduler. Needs `--allow-writes`. |
+| `takt enable <id>` | Arms the schedule of an installed job. Needs `--allow-writes`. |
+| `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
+
+`SCHED` in the status table is `on` (installed and armed), `off` (installed, disarmed) or `-` (not installed). `NEXT` uses the clock of the host.
+
+## Setup
+
+| Command | What it does |
+|---|---|
+| `takt init` | Writes a starter `jobs.toml` with one example job. It never overwrites a file. |
+| `takt install` | Registers every job with the scheduler of this OS. |
+| `takt uninstall [id ...]` | Stops and removes jobs. Without ids, it removes every job in the file. |
+| `takt preflight` | Runs the `needs` and `wants` checks of every job and prints the result. |
+| `takt run <id>` | Runs a job through the wrapper now, in this terminal. The scheduler calls this command. |
+| `takt run <id> --dry-run` | Shows the locks, the `after` order, the preflight result and the steps. Runs nothing. |
+| `takt render [--out DIR]` | Writes the launchd, systemd and Task Scheduler files to `DIR` (default `./staging`). |
+
+`install` on each OS:
+
+- macOS: writes `~/Library/LaunchAgents/dev.takt.<id>.plist` and runs `launchctl bootstrap`.
+- Linux: writes `~/.config/systemd/user/takt-<id>.{service,timer}`, then runs `daemon-reload` and `enable --now`.
+- Windows: writes the task XML to the state directory and runs `schtasks /Create /TN \takt\<id>`.
+
+`install` also retires what a job names in `replaces` (see [jobs.md](jobs.md#replaces)).
+
+## Other hosts
+
+| Command | What it does |
+|---|---|
+| `takt --host <h> <command>` | Runs the command on host `h` over ssh. `--host` must be the first argument. |
+| `takt --host <h> push` | Copies `takt.py` and `jobs.<h>.toml` to the host. Needs `--allow-writes`. |
+| `takt --host <h> install` | Pushes, then installs on the host. Needs `--allow-writes`. |
+
+See [hosts.md](hosts.md).
+
+## Migration from cron and launchd
+
+| Command | What it does |
+|---|---|
+| `takt import-cron [--file F]` | Reads `crontab -l` (or `F`) and prints the jobs as TOML. |
+| `takt import-plist <file>` | Reads a LaunchAgent plist and prints it as a job in TOML. |
+
+Both commands only read. Copy the output into your jobs file and edit it.
+
+## TUI
+
+The TUI is [fzf](https://github.com/junegunn/fzf) over `takt status -A`. The bottom pane shows `takt show` for the selected job.
+
+| Key | Action |
+|---|---|
+| Type | Filter the rows. |
+| `enter` | Open `takt show` in a pager. |
+| `ctrl-r` | Refresh. |
+| `ctrl-s` | Start the job. Only with `takt ui --allow-writes`. |
+| `ctrl-e` | Enable the job. Only with `takt ui --allow-writes`. |
+| `ctrl-x` | Disable the job. Only with `takt ui --allow-writes`. |
+
+The result of a key shows in the footer.
+
+## Checks
+
+| Command | What it does |
+|---|---|
+| `takt --check` | Runs the self-test. It needs no network and no credentials, and takes about 6 seconds. |
+| `takt --version` | Prints the version. |
+
+## Files
+
+| Path | Contents |
+|---|---|
+| `~/.config/takt/jobs.toml` | The jobs of this machine. `TAKT_CONFIG` changes the directory. |
+| `~/.config/takt/jobs.<host>.toml` | The jobs of another host. |
+| `~/.local/state/takt/<id>.json` | The last run record of a job. `TAKT_STATE` changes the directory. |
+| `~/.local/state/takt/locks/` | One lock file for each lock name. |
+| `~/.local/state/takt/log/` | The output of the wrapper under launchd. |
+| `~/.local/state/takt/retired/` | Plists that `install` took out of service. |
+| `~/.local/state/takt/crontab.bak` | The crontab before `install` changed it. |
+
+## Exit codes of `takt run`
+
+| Code | Meaning |
+|---|---|
+| 0 | `ok`, or a deliberate skip (missed slot with `catch_up = "skip"`, or already run in this slot). |
+| 1 | `partial` or `failed`. |
+| 2 | Skipped, because a `needs` check failed. |
+| 75 | `lock-timeout`. |
