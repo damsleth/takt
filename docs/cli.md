@@ -12,8 +12,8 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 | `takt status` | Shows the scheduler state, the last run and the next slot of every job. |
 | `takt status -A` | The same for this machine and every host in `~/.config/takt/`. Hosts run in parallel. |
 | `takt status --json` | The same rows as JSON, for other tools. |
-| `takt show <id>` | Shows the last record of a job: steps, exit codes, preflight, and the end of its logs. |
-| `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. If the job is already running, takt says so and starts nothing. Needs `--allow-writes`. |
+| `takt show <id>` | Shows the last record of a job: steps, exit codes, step notes, preflight, and the end of its logs. |
+| `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. If the job is already running, also while it waits for a lock, takt says so and starts nothing. Needs `--allow-writes`. |
 | `takt enable <id>` | Arms the schedule of an installed job. Needs `--allow-writes`. |
 | `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
 
