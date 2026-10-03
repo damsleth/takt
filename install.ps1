@@ -30,7 +30,13 @@ if ($env:TAKT_SOURCE) {
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile "$target.new"
 }
 Move-Item "$target.new" $target -Force
-Set-Content -Path (Join-Path $bin 'takt.cmd') -Encoding ASCII -Value "@`"$py`" `"$target`" %*"
+# cmd.exe reads takt.cmd in the OEM code page, so a literal non-ASCII profile path
+# (C:\Users\Jørgen) would break. Paths under the profile are written as %USERPROFILE%.
+$pyRef = $py -ireplace [regex]::Escape($env:USERPROFILE), '%USERPROFILE%'
+if ($pyRef -match '[^\x00-\x7F]') {
+    throw "The Python path has non-ASCII characters outside your profile: $py. Install Python under your profile or on an ASCII path."
+}
+Set-Content -Path (Join-Path $bin 'takt.cmd') -Encoding ASCII -Value "@`"$pyRef`" `"%USERPROFILE%\.local\share\takt\takt.py`" %*"
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $bin) {
