@@ -30,7 +30,9 @@ On macOS and Linux the lock is `flock`. Each step inherits the open lock files, 
 
 A process that the step starts keeps the lock only if it inherits the lock files. A shell `&` keeps them open. Python's `subprocess` closes them by default (`close_fds=True`), so a Python step that starts a background process does not protect that process with the lock. A background process that keeps the lock files holds the lock until it exits.
 
-On Windows the lock is `msvcrt.locking`. It ends with the wrapper process: if something kills the wrapper alone, a step that still runs no longer holds the lock.
+On Windows the lock is `msvcrt.locking`, and it ends with the wrapper process. The wrapper runs in a job object that ends its steps when the wrapper exits or is killed, so a step never runs without its lock.
+
+Processes that a step leaves running end with the job on every scheduler: systemd stops the service's cgroup, launchd ends the job's process group, and on Windows the job object closes.
 
 ## Ordering
 
@@ -78,8 +80,9 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
 
-- **Self-test**: 125 checks pass on macOS. A copy pushed to Linux passes 120, and Windows passes 117. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files.
-- **Mutation tests**: 37 breaks of the logic, each made on a copy: 16 for the fixes of the first external review, 12 for the fixes of the second, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 37. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Self-test**: 137 checks pass on macOS. A copy pushed to Linux passes 132, and Windows passes 130. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
+- **Mutation tests**: 50 breaks of the logic, each made on a copy: 16 for the fixes of the first external review, 12 for the second, 13 for the third (one of them run on Windows), and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 50. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Uninstall of a running job**: a job that was running at uninstall was gone afterwards on launchd, systemd and Task Scheduler (1 process before, 0 after). On Linux with no user bus, `uninstall` refused, exited with 1 and kept the unit files.
 - **Reinstall**: on macOS, a throwaway job installed twice with a custom state directory loaded, ran from `launchctl kickstart` with its record in that directory, and uninstalled. On Linux, a second install restarted the timer.
 - **Locks**: two real processes in the same minute with a shared lock never overlap, and the second waits and succeeds. The same pair without the lock overlaps, so the test can see the failure. This passes on all three OSes.
 - **Live runs on Linux and Windows**: a probe job installed, fired at its slot from systemd and from Task Scheduler, was disabled, enabled, fired again at the next slot, was started by hand and was uninstalled. `status -A` over three hosts took 3.6 seconds.
@@ -97,7 +100,6 @@ Not measured yet: a week of real jobs under launchd, a sleep and wake under laun
 ## Limits
 
 - A step that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. takt has no step timeout.
-- On Windows, a killed wrapper releases its locks while its step can still run.
 - `--check` does not run the installers. They were tested by hand on macOS, Linux and Windows.
 - The Windows installer writes paths under the user profile as `%USERPROFILE%` in `takt.cmd`. A Python path with non-ASCII characters outside the profile stops the installer with an error. No account with a non-ASCII name has been tested.
 - A failed step is recorded. takt does not retry it.

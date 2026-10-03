@@ -48,6 +48,7 @@ The login shell on the host can be `sh` or PowerShell, and ssh joins arguments w
 - Jobs install as Task Scheduler tasks in the `\takt\` folder.
 - Tasks run as the ssh user, only while that user is logged on. takt stores no password.
 - Tasks run with `pythonw.exe`, and each step starts without a window, so no console window opens.
+- The wrapper runs in a job object, so `schtasks /End` and `uninstall` end its steps too.
 - Use argv lists for commands. A string command runs through `/bin/sh -c`, which Windows does not have.
 
 ## Differences between schedulers
@@ -55,6 +56,7 @@ The login shell on the host can be `sh` or PowerShell, and ssh joins arguments w
 | Topic | Behavior |
 |---|---|
 | Time zone | Each host uses its own clock. `NEXT` in `status -A` shows host time, so two hosts can show different times for the same slot. |
+| Uninstall a running job | launchd boots it out, systemd stops the service, Task Scheduler ends the task. The job's processes end with it. |
 | Start a disabled job | systemd starts the service. Task Scheduler refuses with "could not run because it is disabled". takt shows the error from the scheduler. |
 | Trigger in the record | A run from `takt start` shows the trigger `scheduled`, because the scheduler starts the same command as a timed run. |
 | Missed slots | launchd and systemd (`Persistent=true`) run a missed slot once after wake. Task Scheduler does the same with `StartWhenAvailable`. |
