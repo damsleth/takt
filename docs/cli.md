@@ -13,7 +13,7 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 | `takt status -A` | The same for this machine and every host in `~/.config/takt/`. Hosts run in parallel. |
 | `takt status --json` | The same rows as JSON, for other tools. |
 | `takt show <id>` | Shows the last record of a job: steps, exit codes, preflight, and the end of its logs. |
-| `takt start <id>` | Starts the job now, through the scheduler. Needs `--allow-writes`. |
+| `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. Needs `--allow-writes`. |
 | `takt enable <id>` | Arms the schedule of an installed job. Needs `--allow-writes`. |
 | `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
 
@@ -37,7 +37,7 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 - Linux: writes `~/.config/systemd/user/takt-<id>.{service,timer}`, then runs `daemon-reload` and `enable --now`.
 - Windows: writes the task XML to the state directory and runs `schtasks /Create /TN \takt\<id>`.
 
-Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. If launchd refuses to boot out a loaded job (a takt job or a `replaces` target), `install` stops before it moves or writes a plist. Each label is booted out once, also when two jobs replace the same label or a `replaces` names a job that `install` retires. On systemd, a restart runs a missed slot once (`Persistent=true`). If you removed or renamed a job, `install` first retires the takt job that the scheduler still has under the old id.
+Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. If launchd refuses to boot out a loaded job (a takt job or a `replaces` target), `install` stops before it moves or writes a plist. Each label is booted out once, also when two jobs replace the same label or a `replaces` names a job that `install` retires. On systemd, a restart runs a missed slot once (`Persistent=true`). If you removed or renamed a job, `install` first retires the takt job that the scheduler still has under the old id. If you removed a job's schedule, `install` disables and removes its old systemd timer.
 
 Before `install` and `uninstall` plan anything, takt reads the job list of the scheduler. It also finds a loaded takt job whose plist is gone, and it looks up each id that you give to `uninstall`. If it cannot read it (for example, no systemd user bus), the command prints the error, exits with 1 and changes nothing.
 
