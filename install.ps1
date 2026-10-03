@@ -39,6 +39,7 @@ if ($pyRef -match '[^\x00-\x7F]') {
 Set-Content -Path (Join-Path $bin 'takt.cmd') -Encoding ASCII -Value "@`"$pyRef`" `"%USERPROFILE%\.local\share\takt\takt.py`" %*"
 
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if (-not $userPath) { $userPath = '' }  # a new account can have no user Path at all
 if (($userPath -split ';') -notcontains $bin) {
     [Environment]::SetEnvironmentVariable('Path', ($userPath.TrimEnd(';') + ";$bin").TrimStart(';'), 'User')
     $env:Path += ";$bin"

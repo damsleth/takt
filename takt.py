@@ -259,8 +259,10 @@ def toml_job(j) -> str:
 # ---------------------------------------------------------------- state, locks
 
 def state_dir(a=None) -> Path:
+    """Absolute: a relative --state or TAKT_STATE would resolve against the scheduler's
+    working directory, and scheduled and manual runs would then use different locks."""
     return Path(getattr(a, "state", None) or os.environ.get("TAKT_STATE")
-                or Path.home() / ".local/state/takt")
+                or Path.home() / ".local/state/takt").expanduser().absolute()
 
 
 def read_record(state: Path, jid):
@@ -272,7 +274,7 @@ def read_record(state: Path, jid):
 
 def write_record(state: Path, rec):
     state.mkdir(parents=True, exist_ok=True)
-    tmp = state / f".{rec['id']}.json.tmp"
+    tmp = state / f".{rec['id']}.{os.getpid()}.json.tmp"  # per writer: two writers never share it
     tmp.write_text(json.dumps(rec, indent=1) + "\n")
     os.replace(tmp, state / f"{rec['id']}.json")
 
@@ -491,6 +493,12 @@ def slot_of(job, now):
     return prev_slot(parse_cron(job["schedule"]), now)
 
 
+def pulled_for(state: Path, jid, slot):
+    """The job already ran for this slot, pulled in by another job."""
+    last = read_record(state, jid)
+    return bool(last and last.get("pulled_by") and last.get("slot") == slot.isoformat()) and last
+
+
 def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=print):
     """Returns the process exit code: 0 ok or deliberately skipped, 1 partial/failed,
     2 preflight skip, 75 lock timeout."""
@@ -513,9 +521,15 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
         for s in job["steps"]:
             say(f"  step {s['id']}: {shlex.join(s['command'])[:110]}")
         return 0
+    if scheduled and (last := pulled_for(state, jid, slot)):  # before the wait: nothing to do
+        say(f"{jid}: already ran for slot {slot:%F %R} (pulled in by {last['pulled_by']})")
+        return 0
     try:
         locks = Locks(state, names, job["lock_timeout"]).__enter__()
     except TimeoutError as e:
+        if scheduled and pulled_for(state, jid, slot):  # pulled in while we waited: keep that record
+            say(f"{jid}: already ran for slot {slot:%F %R} (pulled in while waiting)")
+            return 0
         rec = {"id": jid, "slot": slot.isoformat(), "trigger": trig, "pulled_by": None,
                "started": datetime.now().isoformat(timespec="seconds"), "duration_s": 0,
                "status": "lock-timeout", "exit": 75, "steps": [], "preflight": preflight(job),
@@ -524,8 +538,7 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
         say(f"{jid}: lock-timeout ({rec['note']})")
         return 75
     try:
-        last = read_record(state, jid)  # re-read: a job holding the lock may have pulled us in
-        if scheduled and last and last.get("pulled_by") and last.get("slot") == slot.isoformat():
+        if scheduled and (last := pulled_for(state, jid, slot)):  # again: pulled in while we waited
             say(f"{jid}: already ran for slot {slot:%F %R} (pulled in by {last['pulled_by']})")
             return 0
         order = []
@@ -781,8 +794,10 @@ def split_steps(cmd):
     """Shell line -> steps, when it is only argv, `;`, `>>` and `2>>`. Anything else raises,
     and the caller keeps the line as one `sh -c` step with the text verbatim: expansion
     ($, `, globs, ~, braces), cron's % and a truncating > change meaning outside a shell."""
-    if re.search(r"[$`*?\[{~%]", cmd):
+    if re.search(r"[$`*?\[{~]", cmd):
         raise ValueError("shell expansion")
+    if re.search(r"(^|\s)2\s+>>", cmd):  # `echo 2 >> f`: the 2 is an argument, only `2>>` is stderr
+        raise ValueError("ambiguous 2 before >>")
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     toks = list(lex)
@@ -800,6 +815,8 @@ def split_steps(cmd):
                 out = toks[i + 1]
             i += 2
             continue
+        if not argv and re.match(r"[A-Za-z_]\w*=", t):  # NAME=value cmd: an environment prefix
+            raise ValueError("environment assignment")
         if t == ";":
             steps.append((argv, out, err))
             argv, out, err = [], None, None
@@ -821,7 +838,11 @@ def import_cron(text):
     jobs, skipped, warns, seen = [], [], [], set()
     for i, raw in enumerate(lines):
         s = raw.strip()
-        if not s or re.match(r"^[A-Z_]+=", s):
+        if not s:
+            continue
+        if re.match(r"^[A-Za-z_]\w*\s*=", s):
+            warns.append(f"line {i + 1}: crontab environment {s!r} is not imported; set it in "
+                         "[settings] path or in the commands")
             continue
         if s.startswith("#"):
             if cron_like(s.lstrip("#").strip()):
@@ -830,6 +851,11 @@ def import_cron(text):
         parts = s.split(None, 1) if s.startswith("@") else s.split(None, 5)
         sched, cmd = (parts[0], parts[1]) if s.startswith("@") else (" ".join(parts[:5]), parts[5])
         sched = ALIASES.get(sched, sched)
+        if re.search(r"(?<!\\)%", cmd):  # cron turns an unescaped % into a newline and stdin
+            warns.append(f"line {i + 1}: not imported: an unescaped % is cron's stdin separator, "
+                         "which a takt job cannot express")
+            continue
+        cmd = cmd.replace("\\%", "%")
         name = None
         j = i - 1
         block = []
@@ -943,23 +969,49 @@ def read_crontab(spec, run=subprocess.run):
         sys.exit("a job has replaces = [\"cron:...\"], but crontab is not installed")
 
 
-def plan_uninstall(ids, agents_dir: Path, be):
-    """Stop and remove what install registered. ponytail: does not un-retire `replaces`;
-    the retired plist and crontab.bak are kept under state for doing that by hand."""
+def installed_ids(be, agents_dir: Path, text=None):
+    """Every job takt has registered here, from the scheduler's files (launchd, systemd) or
+    its task list (schtasks), whether or not the spec still names it."""
+    if be == "launchd":
+        return sorted(p.name[len(PREFIX) + 1:-6] for p in agents_dir.glob(f"{PREFIX}.*.plist"))
+    if be == "systemd":
+        return sorted(p.name[5:-6] for p in agents_dir.glob("takt-*.timer"))
+    text = native_text(be, []) if text is None else text
+    return sorted(n for n in (line.strip().partition("|")[0] for line in text.splitlines()) if n)
+
+
+def plan_uninstall(ids, agents_dir: Path, be, nat):
+    """Stop and remove what install registered. Only a job the scheduler has is stopped, so a
+    refusal from the scheduler is a real error, and the plan stops before deleting its files.
+    `nat` is parse_native() output. ponytail: does not un-retire `replaces`; the retired
+    plist and crontab.bak are kept under state for doing that by hand."""
     acts = []
     for jid in ids:
+        inst, loaded = nat.get(jid, (False, False))
         if be == "launchd":
-            acts.append(("run", ["launchctl", "bootout", f"gui/{_uid()}/{PREFIX}.{jid}"], None))
+            if loaded:
+                acts.append(("run", ["launchctl", "bootout", f"gui/{_uid()}/{PREFIX}.{jid}"], None))
             acts.append(("rm", agents_dir / f"{PREFIX}.{jid}.plist", None))
         elif be == "systemd":
-            acts.append(("run", ["systemctl", "--user", "disable", "--now", f"takt-{jid}.timer"], None))
+            if inst:
+                acts.append(("run", ["systemctl", "--user", "disable", "--now", f"takt-{jid}.timer"], None))
             acts += [("rm", agents_dir / f"takt-{jid}.{x}", None) for x in ("timer", "service")]
         else:
-            acts.append(("run", ["schtasks", "/Delete", "/TN", task_name(jid), "/F"], None))
+            if inst:
+                acts.append(("run", ["schtasks", "/Delete", "/TN", task_name(jid), "/F"], None))
             acts.append(("rm", agents_dir / f"takt-{jid}.xml", None))
     if be == "systemd":
         acts.append(("run", ["systemctl", "--user", "daemon-reload"], None))
     return acts
+
+
+def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab=""):
+    """install: retire the takt jobs the spec no longer names, then install the spec.
+    uninstall: the given ids, or every job in the spec and every takt job registered here."""
+    if cmd == "install":
+        return (plan_uninstall([i for i in known if i not in spec], agents_dir, be, nat)
+                + plan_install(spec, ctx, agents_dir, crontab, be))
+    return plan_uninstall(list(ids or sorted(set(spec) | set(known))), agents_dir, be, nat)
 
 
 def describe(act):
@@ -1048,12 +1100,16 @@ def parse_native(be, text, ids, agents_dir: Path):
     return out
 
 
-def native_states(spec, be, agents_dir: Path):
+def native_text(be, ids):
     try:
-        r = subprocess.run(native_query(be, list(spec)), capture_output=True, text=True, timeout=30, **NO_WINDOW)
-        return parse_native(be, r.stdout, list(spec), agents_dir)
+        return subprocess.run(native_query(be, ids), capture_output=True, text=True, timeout=30, **NO_WINDOW).stdout
     except (OSError, subprocess.SubprocessError):
-        return {}
+        return ""
+
+
+def native_states(ids, be, agents_dir: Path):
+    ids = list(ids)
+    return parse_native(be, native_text(be, ids), ids, agents_dir)
 
 
 def detail_of(r):
@@ -1176,6 +1232,7 @@ def on_host(host, rest):
     """`takt --host H <cmd> ...`: H's own copy of takt runs the command, so units are rendered
     with H's paths and the scheduler is H's. install also pushes; push is gated like install."""
     host_settings(host)
+    cmdline = remote_argv(host, rest)  # validate every argument before push writes anything
     cmd, writes = (rest[0] if rest else ""), "--allow-writes" in rest
     if cmd in ("push", "install"):
         if not writes:
@@ -1186,7 +1243,7 @@ def on_host(host, rest):
         if cmd == "push":
             print("" if writes else "\nnothing written. Re-run with --allow-writes.")
             return 0
-    return subprocess.run(remote_argv(host, rest)).returncode
+    return subprocess.run(cmdline).returncode
 
 
 def remote_rows(host):
@@ -1388,18 +1445,22 @@ def main(argv=None):
         return 0
     if a.cmd in ("install", "uninstall"):
         spec = load_spec(a.spec)
-        if a.cmd == "install":
-            cron = read_crontab(spec)
-            acts, check = plan_install(spec, make_ctx(a), adir, cron, be), True
-        else:
-            ids = a.ids or list(spec)
-            acts, check = plan_uninstall(ids, adir, be), False  # stopping what is not running is fine
+        known = installed_ids(be, adir)
+        nat = native_states(sorted(set(spec) | set(known)), be, adir)
+        acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
+                          ctx=make_ctx(a) if a.cmd == "install" else None,
+                          crontab=read_crontab(spec) if a.cmd == "install" else "")
         for x in acts:
             print(("DO   " if a.allow_writes else "PLAN ") + describe(x))
         if not a.allow_writes:
             print("\nnothing written. Re-run with --allow-writes to perform the plan above.")
             return 0
-        apply_plan(acts, lambda argv_, inp: subprocess.run(argv_, input=inp, check=check, **NO_WINDOW))
+        try:
+            apply_plan(acts, lambda argv_, inp: subprocess.run(argv_, input=inp, check=True, **NO_WINDOW))
+        except subprocess.CalledProcessError as e:
+            print(f"failed: {' '.join(e.cmd)} exited {e.returncode}. Stopped; the steps after it did not run.",
+                  file=sys.stderr)
+            return 1
         return 0
     ap.print_help()
     return 0
@@ -1424,6 +1485,7 @@ def self_check():
         check_install(ok, tmp)
         check_admin(ok, tmp)
         check_review(ok, tmp)
+        check_review2(ok, tmp)
         check_examples(ok, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1822,7 +1884,7 @@ def check_admin(ok, tmp):
                                     ["systemctl", "--user", "restart", f"takt-{j}.timer"])],
        "install systemd: units written, daemon-reload, then enable and restart (a reinstall takes effect)")
     calls = []
-    apply_plan(plan_uninstall(["a"], ud, "systemd"), lambda a, i: calls.append(a))
+    apply_plan(plan_uninstall(["a"], ud, "systemd", {"a": (True, True)}), lambda a, i: calls.append(a))
     ok(calls == [["systemctl", "--user", "disable", "--now", "takt-a.timer"], ["systemctl", "--user", "daemon-reload"]]
        and not (ud / "takt-a.timer").exists() and (ud / "takt-b.timer").exists(), "uninstall systemd: stops, removes only that job")
     xd, calls = tmp / "xml", []
@@ -1956,6 +2018,103 @@ def check_review(ok, tmp):
         ev = marks(mk)
         ok("end" in ev.get("a", {}) and ev["b"]["start"] >= ev["a"]["end"],
            "lock: a killed wrapper's still-running step keeps the lock")
+
+
+def check_review2(ok, tmp):
+    """Regressions for the second external review (2026-10-03)."""
+    q = lambda *_: None
+    # a relative state dir is made absolute, so the scheduler and a shell share the locks
+    old = os.environ.get("TAKT_STATE")
+    os.environ["TAKT_STATE"] = "rel/state"
+    try:
+        ok(state_dir(argparse.Namespace(state="rel")).is_absolute() and state_dir().is_absolute()
+           and state_dir().parts[-2:] == ("rel", "state"), "state: relative --state and TAKT_STATE become absolute")
+    finally:
+        os.environ.pop("TAKT_STATE") if old is None else os.environ.__setitem__("TAKT_STATE", old)
+
+    # a job that was pulled in for its slot exits at once, and a lock-timeout never overwrites that record
+    d = tmp / "dedup"
+    d.mkdir()
+    a = mkjob("a", schedule="0 * * * *", lock_timeout=1, command=[PY, "-c", "pass"])
+    now, slot = datetime(2026, 9, 30, 14, 0, 30), datetime(2026, 9, 30, 14, 0)
+    pulled = {"id": "a", "slot": slot.isoformat(), "pulled_by": "b", "status": "ok", "steps": []}
+    holder = Locks(d / "st", ["job-a"], 5).__enter__()
+    try:
+        write_record(d / "st", pulled)
+        t0 = time.time()
+        code = run_job({"a": a}, "a", d / "st", now, scheduled=True, say=q)
+        ok(code == 0 and time.time() - t0 < 0.5 and read_record(d / "st", "a")["pulled_by"] == "b",
+           "dedup: a job pulled in for this slot exits before it waits for the lock")
+        (d / "st" / "a.json").unlink()
+        import threading
+        threading.Timer(0.3, write_record, (d / "st", pulled)).start()
+        code = run_job({"a": a}, "a", d / "st", now, scheduled=True, say=q)
+        ok(code == 0 and read_record(d / "st", "a").get("pulled_by") == "b",
+           "dedup: a lock-timeout keeps the record of a pull-in that happened during the wait")
+    finally:
+        holder.__exit__()
+
+    # preflight runs after the lock: the holder makes the file that the waiter needs
+    d = tmp / "prelock"
+    d.mkdir()
+    made = d / "made"
+    spec = write_spec(d, mkjob("b", lock=["res"], command=[PY, "-c", f"import time; open({str(made)!r}, 'w'); time.sleep(0.6)"]),
+                      mkjob("a", lock=["res"], needs=[f"fda:{made}"], command=[PY, "-c", "pass"]))
+    pb = spawn(spec, d / "st", "b")
+    time.sleep(0.25)
+    spawn(spec, d / "st", "a").communicate()
+    pb.communicate()
+    ok(read_record(d / "st", "a")["status"] == "ok", "preflight: runs after the lock, so the holder can satisfy it")
+
+    # cron import: 2 as an argument, NAME=value prefixes, %, environment lines
+    jobs, _, warns = import_cron("MAILTO=me\nPATH=/x:/y\n0 1 * * * echo 2 >> /tmp/log\n0 2 * * * FOO=1 /bin/a\n"
+                                 "0 3 * * * /bin/mail me%hello\n0 4 * * * /bin/date +\\%F\n")
+    cmds = {j["schedule"]: j["steps"][0]["command"] for j in jobs}
+    ok(cmds.get("0 1 * * *") == ["/bin/sh", "-c", "echo 2 >> /tmp/log"]
+       and cmds.get("0 2 * * *") == ["/bin/sh", "-c", "FOO=1 /bin/a"], "import: `echo 2 >>` and NAME=value stay in sh -c")
+    ok("0 3 * * *" not in cmds and any("% is cron" in w for w in warns) and cmds.get("0 4 * * *") == ["/bin/date", "+%F"],
+       "import: an unescaped % is refused with a warning; \\% becomes %")
+    ok(sum("crontab environment" in w for w in warns) == 2, "import: environment lines are reported, not dropped silently")
+
+    # registered jobs: found on disk or in the task list, including ones the spec no longer names
+    la = tmp / "r2-la"
+    la.mkdir()
+    for n in ("old", "new"):
+        (la / f"{PREFIX}.{n}.plist").write_text("x")
+    ok(installed_ids("launchd", la) == ["new", "old"] and installed_ids("schtasks", la, "probe|Ready\r\nx|Disabled\r\n")
+       == ["probe", "x"], "installed: takt jobs found from plists and from the task list")
+    spec = {"new": mkjob("new", schedule="0 * * * *")}
+    nat = {"old": (True, True), "new": (True, False)}
+    acts = plan_admin("install", spec, "launchd", la, ["new", "old"], nat, ctx={**CTX, "state": str(tmp / "r2st")})
+    steps = [(k, a[1] if k in ("run", "try") else Path(a).name) for k, a, _ in acts]
+    ok(steps[:2] == [("run", "bootout"), ("rm", f"{PREFIX}.old.plist")] and ("rm", f"{PREFIX}.new.plist") not in steps,
+       "install: retires a takt job the spec no longer names, before installing")
+    un = plan_admin("uninstall", spec, "launchd", la, ["new", "old"], nat)
+    ok([(k, a[1] if k == "run" else Path(a).name) for k, a, _ in un]
+       == [("rm", f"{PREFIX}.new.plist"), ("run", "bootout"), ("rm", f"{PREFIX}.old.plist")],
+       "uninstall: covers jobs gone from the spec; stops only what the scheduler has loaded")
+
+    def refuse(a, i):
+        if a[1] == "bootout":
+            raise subprocess.CalledProcessError(5, a)
+    try:
+        apply_plan(plan_uninstall(["old"], la, "launchd", nat), refuse)
+        ok(False, "uninstall: a scheduler refusal stops before the files are deleted")
+    except subprocess.CalledProcessError:
+        ok((la / f"{PREFIX}.old.plist").exists(), "uninstall: a scheduler refusal stops before the files are deleted")
+
+    # --host: every argument is checked before push writes anything to the host
+    g, pushed = globals(), []
+    saved = g["CONFIG"], g["push"]
+    g["CONFIG"], g["push"] = tmp, (lambda h: pushed.append(h) or 0)
+    (tmp / "jobs.h.toml").write_text('[settings]\npython = "python3"\n')
+    try:
+        g["on_host"]("h", ["install", "a b", "--allow-writes"])
+        ok(False, "remote: a bad argument is refused before the push")
+    except ValueError:
+        ok(pushed == [], "remote: a bad argument is refused before the push")
+    finally:
+        g["CONFIG"], g["push"] = saved
 
 
 def check_examples(ok, tmp):
