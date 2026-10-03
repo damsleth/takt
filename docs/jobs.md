@@ -31,7 +31,7 @@ A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`.
 | `command` | | One command as an argv list. A string runs through `/bin/sh -c`. |
 | `stdout`, `stderr` | none | Append the output of the command to these files. `~` is expanded, and a missing directory is created. If a file cannot be opened, the step is `failed` with exit code 127 and a note, and the next steps run. |
 | `step` | | Several commands, as `[[job.<id>.step]]` tables. Use `step` or `command`, not both. |
-| `lock` | `[]` | Lock names. Two jobs with the same lock name never run at the same time. |
+| `lock` | `[]` | Lock names: letters, digits, `-` and `_`. Two jobs with the same lock name never run at the same time. |
 | `lock_timeout` | `900` | Seconds to wait for a lock. After this, the run ends as `lock-timeout`. |
 | `after` | `[]` | Job ids that must run first when they are due in the same slot. |
 | `needs` | `[]` | Preflight checks. If one fails, takt skips the job and records why. |
