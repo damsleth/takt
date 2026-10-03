@@ -48,7 +48,7 @@ The login shell on the host can be `sh` or PowerShell, and ssh joins arguments w
 - Jobs install as Task Scheduler tasks in the `\takt\` folder.
 - Tasks run as the ssh user, only while that user is logged on. takt stores no password.
 - Tasks run with `pythonw.exe`, and each step starts without a window, so no console window opens.
-- The wrapper runs in a job object, so `schtasks /End` and `uninstall` end its steps too.
+- The wrapper runs in a job object, so `schtasks /End` and `uninstall` end its steps too. If takt cannot create the job object, the job does not run, and its record says why.
 - Use argv lists for commands. A string command runs through `/bin/sh -c`, which Windows does not have.
 
 ## Differences between schedulers

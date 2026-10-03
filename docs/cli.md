@@ -37,9 +37,9 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 - Linux: writes `~/.config/systemd/user/takt-<id>.{service,timer}`, then runs `daemon-reload` and `enable --now`.
 - Windows: writes the task XML to the state directory and runs `schtasks /Create /TN \takt\<id>`.
 
-Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. On systemd, a restart runs a missed slot once (`Persistent=true`). If you removed or renamed a job, `install` first retires the takt job that the scheduler still has under the old id.
+Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. If launchd refuses to boot out a loaded job (a takt job or a `replaces` target), `install` stops before it moves or writes a plist. On systemd, a restart runs a missed slot once (`Persistent=true`). If you removed or renamed a job, `install` first retires the takt job that the scheduler still has under the old id.
 
-Before `install` and `uninstall` plan anything, takt reads the job list of the scheduler. If it cannot read it (for example, no systemd user bus), the command prints the error, exits with 1 and changes nothing.
+Before `install` and `uninstall` plan anything, takt reads the job list of the scheduler. It also finds a loaded takt job whose plist is gone, and it looks up each id that you give to `uninstall`. If it cannot read it (for example, no systemd user bus), the command prints the error, exits with 1 and changes nothing.
 
 `uninstall` stops only the jobs that the scheduler has registered, including a run that is in progress: launchd boots out the job, systemd stops the timer and the service, and Task Scheduler ends the task before it deletes it. If the scheduler refuses a stop, takt prints the error, exits with 1 and keeps the files of that job.
 
@@ -68,7 +68,7 @@ Both commands only read. Copy the output into your jobs file and edit it.
 
 `import-cron` splits a line into steps only when the line is plain arguments, `;`, `>>` and `2>>`. These lines become one `/bin/sh -c` step with the text unchanged:
 
-- shell expansion: `$`, backticks, `*`, `?`, `[`, `{`, `~`
+- shell expansion: `$`, backticks, `*`, `?`, `[`, `{`, `~`, and any backslash escape (`echo \;`)
 - an environment prefix (`NAME=value cmd`), or a `2` before `>>` that is quoted or spaced (`echo "2">> f`, `echo 2 >> f`): the `2` is an argument
 - a quote next to an operator (`echo ";"`), because the quotes make the operator an argument
 - a truncating `>`, pipes and other operators
