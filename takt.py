@@ -570,13 +570,45 @@ def pulled_for(state: Path, jid, slot):
     return bool(last and last.get("pulled_by") and last.get("slot") == slot.isoformat()) and last
 
 
-def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=print):
+START_TTL = 600  # seconds a `takt start` request waits for the scheduler to run the job
+
+
+def request_start(state: Path, jid):
+    """`takt start` goes through the scheduler, which runs the same --scheduled command as a timed
+    run. This file tells that run it was asked for, so catch_up = "skip" and pull-in dedup do
+    not drop it."""
+    (state / "start").mkdir(parents=True, exist_ok=True)
+    (state / "start" / jid).write_text(repr(time.time()))
+
+
+def take_start(state: Path, jid):
+    """Consume a start request. One older than START_TTL is dropped: a scheduled run long after
+    a failed start must not be mistaken for it."""
+    p = state / "start" / jid
+    try:
+        t = float(p.read_text())
+        p.unlink()
+    except (OSError, ValueError):
+        return False
+    return time.time() - t <= START_TTL
+
+
+def run_admin(cmds):
+    """Native start/enable/disable commands. -> None, or the scheduler's error text."""
+    for c in cmds:
+        r = subprocess.run(c, capture_output=True, text=True, **NO_WINDOW)
+        if r.returncode:
+            return (r.stderr or r.stdout).strip() or str(r.returncode)
+    return None
+
+
+def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=print, trigger=None):
     """Returns the process exit code: 0 ok or deliberately skipped, 1 partial/failed,
     2 preflight skip, 75 lock timeout."""
     now = now or datetime.now()
     job = spec[jid]
     slot = slot_of(job, now)
-    trig = "scheduled" if scheduled else "manual"
+    trig = trigger or ("scheduled" if scheduled else "manual")
     if scheduled and job["catch_up"] == "skip" and job["schedule"] and (now - slot).total_seconds() > SKIP_AFTER:
         say(f"{jid}: skipped, missed slot {slot:%F %R} and catch_up=skip")
         return 0
@@ -1034,6 +1066,9 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", l
             acts.append(("write", agents_dir / f"takt-{jid}.service", svc.encode()))
             if tmr:
                 acts.append(("write", agents_dir / f"takt-{jid}.timer", tmr.encode()))
+            elif (agents_dir / f"takt-{jid}.timer").exists():  # the schedule was removed: retire the old timer
+                acts.append(("run", ["systemctl", "--user", "disable", "--now", f"takt-{jid}.timer"], None))
+                acts.append(("rm", agents_dir / f"takt-{jid}.timer", None))
         else:
             x = agents_dir / f"takt-{jid}.xml"
             acts.append(("write", x, render_schtasks(j, ctx).encode("utf-16")))  # schtasks wants UTF-16
@@ -1533,7 +1568,10 @@ def main(argv=None):
                                         "status": "skipped", "exit": 2, "steps": [], "preflight": [], "note": note})
             print(f"{a.id}: {note}", file=sys.stderr)
             return 2
-        return run_job(spec, a.id, state_dir(a), now, a.scheduled, a.dry_run)
+        scheduled, trig = a.scheduled, None
+        if scheduled and not a.dry_run and take_start(state_dir(a), a.id):
+            scheduled, trig = False, "start"  # asked for by `takt start`: run it, whatever the slot
+        return run_job(spec, a.id, state_dir(a), now, scheduled, a.dry_run, trigger=trig)
     be = backend()
     adir = Path(getattr(a, "agents_dir", None) or default_dir(be, state_dir(a)))
     if a.cmd == "status":
@@ -1557,11 +1595,14 @@ def main(argv=None):
         if not a.allow_writes:
             print("\n".join("PLAN " + " ".join(c) for c in cmds) + "\nnothing done. Re-run with --allow-writes.")
             return 0
-        for c in cmds:
-            p = subprocess.run(c, capture_output=True, text=True, **NO_WINDOW)
-            if p.returncode:
-                print(f"{a.id}: {a.cmd} failed: {(p.stderr or p.stdout).strip() or p.returncode}")
-                return 1
+        if a.cmd == "start":
+            request_start(state_dir(a), a.id)
+        err = run_admin(cmds)
+        if err:
+            if a.cmd == "start":
+                (state_dir(a) / "start" / a.id).unlink(missing_ok=True)
+            print(f"{a.id}: {a.cmd} failed: {err}")
+            return 1
         print(f"{a.id}: {a.cmd} ok ({be})")
         return 0
     if a.cmd == "render":
@@ -1639,6 +1680,7 @@ def self_check():
         check_review3(ok, tmp)
         check_review4(ok, tmp)
         check_review5(ok, tmp)
+        check_review6(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2465,6 +2507,55 @@ def check_review5(ok, tmp):
     cmds = {j["schedule"]: j["steps"][0]["command"] for j in jobs}
     ok(cmds["0 1 * * *"] == ["/bin/sh", "-c", "/bin/echo abc#def"] and cmds["0 2 * * *"] == ["/bin/sh", "-c", "cd /tmp; /bin/pwd"]
        and cmds["0 3 * * *"] == ["/bin/a"], "import: `#` in a word and `cd` stay in sh -c; the name comment is not a command")
+
+
+def check_review6(ok, tmp):
+    """Regressions for the sixth external review (2026-10-04)."""
+    import contextlib
+    import io
+    # removing a schedule retires the systemd timer that the old install left armed
+    ud = tmp / "r6-units"
+    ud.mkdir()
+    (ud / "takt-m.timer").write_text("[Timer]\n")
+    acts = plan_install({"m": mkjob("m", command=[PY, "-c", "pass"])}, {**CTX, "state": str(tmp / "r6st")}, ud, "", "systemd")
+    steps = [(k, a[2:4] if k == "run" else Path(a).name) for k, a, _ in acts if k in ("run", "rm")]
+    ok(steps[:2] == [("run", ["disable", "--now"]), ("rm", "takt-m.timer")] and steps[2] == ("run", ["daemon-reload"]),
+       "install systemd: removing a schedule disables and removes the old timer before the reload")
+
+    # `takt start` is a manual run even though the scheduler starts it with --scheduled
+    d = tmp / "r6-start"
+    d.mkdir()
+    mk = d / "m.txt"
+    specf = write_spec(d, mkjob("d", schedule="0 0 * * *", catch_up="skip", command=cmd_mark(mk, "d", 0)))
+    st = d / "st"
+    noon = ["run", "d", "--spec", str(specf), "--state", str(st), "--scheduled", "--now", "2026-10-03T12:00:00"]
+    q = contextlib.redirect_stdout(io.StringIO())
+    with q:
+        main(noon)
+    ok("d" not in marks(mk), "start: a scheduled run 12 hours late with catch_up=skip is skipped")
+    request_start(st, "d")
+    with contextlib.redirect_stdout(io.StringIO()):
+        main(noon)
+    r = read_record(st, "d")
+    ok("d" in marks(mk) and r["trigger"] == "start" and not (st / "start" / "d").exists(),
+       "start: the run that `takt start` asked for runs, records trigger start, and consumes the request")
+    (st / "start" / "d").write_text(repr(time.time() - START_TTL - 5))
+    ok(not take_start(st, "d") and not (st / "start" / "d").exists(), "start: an expired request is dropped")
+
+    # the start verb leaves the request, and removes it again when the scheduler refuses
+    g, calls = globals(), []
+    saved = g["run_admin"]
+    try:
+        g["run_admin"] = lambda cmds: calls.append(cmds) or None
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = main(["start", "d", "--spec", str(specf), "--state", str(st), "--allow-writes"])
+        ok(code == 0 and calls and (st / "start" / "d").exists(), "start: the verb leaves a start request for the run")
+        g["run_admin"] = lambda cmds: "refused"
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = main(["start", "d", "--spec", str(specf), "--state", str(st), "--allow-writes"])
+        ok(code == 1 and not (st / "start" / "d").exists(), "start: a refused start leaves no request behind")
+    finally:
+        g["run_admin"] = saved
 
 
 def check_windows_last(ok):
