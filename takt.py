@@ -429,10 +429,14 @@ def yaams_failed(out: str):
     for line in reversed(out.strip().splitlines()):
         if line.startswith("{"):
             try:
-                err = json.loads(line).get("error") or {}
+                obj = json.loads(line)
             except ValueError:
                 return [], None
-            return list(err.get("failed_sources") or []), err.get("code")
+            err = obj.get("error") if isinstance(obj, dict) else None
+            if not isinstance(err, dict):  # {"error": "connection refused"}: report it, do not crash the wrapper
+                return [], (f"report: {str(err)[:200]}" if err else None)
+            fs = err.get("failed_sources") or []
+            return [str(x) for x in (fs if isinstance(fs, list) else [fs])], err.get("code")
     return [], None
 
 
@@ -591,6 +595,15 @@ def take_start(state: Path, jid):
     except (OSError, ValueError):
         return False
     return time.time() - t <= START_TTL
+
+
+def job_running(state: Path, jid):
+    """A wrapper for this job is running: it holds the job's own lock (`job-<id>`)."""
+    try:
+        Locks(state, [f"job-{jid}"], 0).__enter__().__exit__()
+        return False
+    except TimeoutError:
+        return True
 
 
 def run_admin(cmds):
@@ -790,6 +803,7 @@ def render_systemd(job, ctx):
 
 
 TS_NS = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+SCHTASKS_MAX_TRIGGERS = 48  # Task Scheduler's limit per task
 DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
           "October", "November", "December"]
@@ -853,6 +867,9 @@ def render_schtasks(job, ctx) -> str:
                 _sub(_sub(t, "ScheduleByDay"), "DaysInterval", 1)
     if job["run_at_load"]:
         _sub(_sub(trig, "LogonTrigger"), "Enabled", "true")
+    if len(trig) > SCHTASKS_MAX_TRIGGERS:  # registration would fail; refuse while planning, before any change
+        raise ValueError(f"job {job['id']}: schedule {job['schedule']!r} needs {len(trig)} Task Scheduler triggers; "
+                         f"a task can have at most {SCHTASKS_MAX_TRIGGERS}")
     s = _sub(root, "Settings")
     _sub(s, "MultipleInstancesPolicy", "IgnoreNew")
     _sub(s, "StartWhenAvailable", "true" if job["catch_up"] == "run-once" else "false")
@@ -1596,6 +1613,9 @@ def main(argv=None):
             print("\n".join("PLAN " + " ".join(c) for c in cmds) + "\nnothing done. Re-run with --allow-writes.")
             return 0
         if a.cmd == "start":
+            if job_running(state_dir(a), a.id):  # the scheduler would not start a second copy; no request
+                print(f"{a.id}: already running; not started")
+                return 0
             request_start(state_dir(a), a.id)
         err = run_admin(cmds)
         if err:
@@ -1638,9 +1658,13 @@ def main(argv=None):
         except RuntimeError as e:
             print(f"failed: {e}. Nothing changed.", file=sys.stderr)
             return 1
-        acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
-                          ctx=make_ctx(a) if a.cmd == "install" else None,
-                          crontab=read_crontab(spec) if a.cmd == "install" else "", loaded=loaded)
+        try:
+            acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
+                              ctx=make_ctx(a) if a.cmd == "install" else None,
+                              crontab=read_crontab(spec) if a.cmd == "install" else "", loaded=loaded)
+        except ValueError as e:  # a job the scheduler cannot take: nothing has changed yet
+            print(f"failed: {e}. Nothing changed.", file=sys.stderr)
+            return 1
         for x in acts:
             print(("DO   " if a.allow_writes else "PLAN ") + describe(x))
         if not a.allow_writes:
@@ -1681,6 +1705,7 @@ def self_check():
         check_review4(ok, tmp)
         check_review5(ok, tmp)
         check_review6(ok, tmp)
+        check_review7(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2555,6 +2580,59 @@ def check_review6(ok, tmp):
             code = main(["start", "d", "--spec", str(specf), "--state", str(st), "--allow-writes"])
         ok(code == 1 and not (st / "start" / "d").exists(), "start: a refused start leaves no request behind")
     finally:
+        g["run_admin"] = saved
+
+
+def check_review7(ok, tmp):
+    """Regressions for the seventh external review (2026-10-04)."""
+    import contextlib
+    import io
+    # Task Scheduler: at most 48 triggers, checked while planning
+    ok(len(ET.fromstring(render_schtasks(mkjob("t", schedule="0,20,40 1-16 * * 1-5"), CTX)).find(f"{{{TS_NS}}}Triggers")) == 48,
+       "schtasks: 3 minutes in 16 hours is 48 triggers")
+    for sched, run_at_load, fits in (("0,20,40 1-16 * * 1-5", False, True), ("0,20,40 1-16 * * 1-5", True, False),
+                                     ("*/5 9-17 * * 1-5", False, False)):
+        try:
+            render_schtasks(mkjob("t", schedule=sched, run_at_load=run_at_load), CTX)
+            ok(fits, f"schtasks: {sched} (run_at_load={run_at_load}) is refused above 48 triggers")
+        except ValueError as e:
+            ok(not fits and "at most 48" in str(e), f"schtasks: {sched} (run_at_load={run_at_load}) fits in 48 triggers")
+    try:
+        plan_install({"t": mkjob("t", schedule="*/5 9-17 * * 1-5")}, {**CTX, "state": str(tmp / "r7st")}, tmp / "r7x", "", "schtasks")
+        ok(False, "install schtasks: too many triggers fails while planning")
+    except ValueError:
+        ok(not (tmp / "r7x").exists(), "install schtasks: too many triggers fails while planning, before any write")
+
+    # report JSON in another shape: a note on the step, and the next steps still run
+    d = tmp / "r7-report"
+    d.mkdir()
+    mk = d / "m.txt"
+    sp = {"j": mkjob("j", step=[
+        {"id": "r", "command": [PY, "-c", "print('{\"error\": \"connection refused\"}')"], "report": "json-failed-sources"},
+        {"id": "after", "command": cmd_mark(mk, "after", 0)}])}
+    run_job(sp, "j", d / "st", say=lambda *_: None)
+    r = read_record(d / "st", "j")
+    ok(r and r["steps"][0]["note"] == "report: connection refused" and "after" in marks(mk),
+       "report: an error that is not an object becomes a note, and later steps run")
+    ok(yaams_failed('[1, 2]') == ([], None) and yaams_failed('{"error": {"failed_sources": "imessage"}}') == (["imessage"], None),
+       "report: other JSON shapes do not crash")
+
+    # `takt start` on a running job: no request, and no native start
+    d = tmp / "r7-start"
+    d.mkdir()
+    specf = write_spec(d, mkjob("d", schedule="0 0 * * *", command=[PY, "-c", "pass"]))
+    g, calls = globals(), []
+    saved = g["run_admin"]
+    holder = Locks(d / "st", ["job-d"], 5).__enter__()
+    try:
+        g["run_admin"] = lambda cmds: calls.append(cmds) or None
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(["start", "d", "--spec", str(specf), "--state", str(d / "st"), "--allow-writes"])
+        ok(not calls and not (d / "st" / "start" / "d").exists() and "already running" in out.getvalue(),
+           "start: a running job is not started again and leaves no request")
+    finally:
+        holder.__exit__()
         g["run_admin"] = saved
 
 
