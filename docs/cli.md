@@ -25,7 +25,7 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 |---|---|
 | `takt init` | Writes a starter `jobs.toml` with one example job. It never overwrites a file. |
 | `takt install` | Registers every job with the scheduler of this OS. |
-| `takt uninstall [id ...]` | Stops and removes jobs. Without ids, it removes every job in the file. |
+| `takt uninstall [id ...]` | Stops and removes jobs. Without ids, it removes every job in the file and every takt job that the scheduler still has. |
 | `takt preflight` | Runs the `needs` and `wants` checks of every job and prints the result. |
 | `takt run <id>` | Runs a job through the wrapper now, in this terminal. The scheduler calls this command. |
 | `takt run <id> --dry-run` | Shows the locks, the `after` order, the preflight result and the steps. Runs nothing. |
@@ -37,9 +37,11 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 - Linux: writes `~/.config/systemd/user/takt-<id>.{service,timer}`, then runs `daemon-reload` and `enable --now`.
 - Windows: writes the task XML to the state directory and runs `schtasks /Create /TN \takt\<id>`.
 
-Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. On systemd, a restart runs a missed slot once (`Persistent=true`).
+Run `install` again after you edit the jobs file. It replaces each registration: launchd boots out the loaded copy first, and systemd restarts the timer. On systemd, a restart runs a missed slot once (`Persistent=true`). If you removed or renamed a job, `install` first retires the takt job that the scheduler still has under the old id.
 
-The scheduled command includes the `--spec` and `--state` paths that `install` used, so a job installed with `--state /some/dir` keeps its records there.
+`uninstall` stops only the jobs that the scheduler has registered. If the scheduler refuses a stop, takt prints the error, exits with 1 and keeps the files of that job.
+
+The scheduled command includes the `--spec` and `--state` paths that `install` used, as absolute paths. A job installed with `--state some/dir` keeps its records and locks there.
 
 `install` also retires what a job names in `replaces` (see [jobs.md](jobs.md#replaces)).
 
@@ -62,7 +64,13 @@ See [hosts.md](hosts.md).
 
 Both commands only read. Copy the output into your jobs file and edit it.
 
-`import-cron` splits a line into steps only when the line is plain arguments, `;`, `>>` and `2>>`. A line with shell expansion (`$`, backticks, `*`, `?`, `[`, `{`, `~`), cron's `%`, a truncating `>` or other operators becomes one `/bin/sh -c` step with the text unchanged, so it means the same thing.
+`import-cron` splits a line into steps only when the line is plain arguments, `;`, `>>` and `2>>`. These lines become one `/bin/sh -c` step with the text unchanged:
+
+- shell expansion: `$`, backticks, `*`, `?`, `[`, `{`, `~`
+- an environment prefix (`NAME=value cmd`), or `2 >>` with a space (the `2` is an argument)
+- a truncating `>`, pipes and other operators
+
+A line with an unescaped `%` is not imported, because cron sends the text after `%` to the command as input, and a takt job has no input. `import-cron` prints a warning for it. An escaped `\%` becomes `%`. Environment lines such as `PATH=...` and `MAILTO=...` are not imported either. Each one gets a warning, so you can move the values to `[settings] path` or into the commands.
 
 ## TUI
 

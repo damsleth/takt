@@ -28,7 +28,7 @@ If a lock is held, the job waits. The record holds `waited_s` and `blocked_on`. 
 
 On macOS and Linux the lock is `flock`. Each step inherits the open lock files, and `flock` belongs to the open file, so the lock stays held until the wrapper and the step have both exited. If something kills the wrapper alone, its running step keeps the lock, and the next job waits for the step. When the last process exits, the OS releases the lock, so a crashed job cannot hold it.
 
-A step that starts a background process passes the lock files to that process too. The lock then stays held while the background process runs. Close inherited file descriptors in such a step, or run the background process outside takt.
+A process that the step starts keeps the lock only if it inherits the lock files. A shell `&` keeps them open. Python's `subprocess` closes them by default (`close_fds=True`), so a Python step that starts a background process does not protect that process with the lock. A background process that keeps the lock files holds the lock until it exits.
 
 On Windows the lock is `msvcrt.locking`. It ends with the wrapper process: if something kills the wrapper alone, a step that still runs no longer holds the lock.
 
@@ -37,6 +37,8 @@ On Windows the lock is `msvcrt.locking`. It ends with the wrapper process: if so
 `after` pulls a dependency in, as `make` does. Job B has `after = ["A"]`. When B starts, it looks at the latest slot of A. If that slot is at or after the slot of B, and A has no record for it, B runs A first, under the locks that B holds. A is recorded under its own slot with `pulled_by = "B"`. When the scheduler starts A, A takes the lock, reads the record and exits.
 
 So A runs once and before B, in each order of start, with no timing assumptions.
+
+A job that another job pulled in for its slot exits at once when the scheduler starts it, before it waits for a lock. If it times out on a lock while the other job pulls it in, it keeps the record of the pull-in and does not write `lock-timeout`.
 
 B checks its own `needs` and `wants` after A has run and after B holds its locks. A can make a check of B pass, for example by refreshing a token that B needs. A dependency with `catch_up = "skip"` is not pulled in when its slot is more than 5 minutes old.
 
@@ -76,8 +78,8 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
 
-- **Self-test**: 113 checks pass on macOS. A copy pushed to Linux passes 108, and Windows passes 105. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files.
-- **Mutation tests**: 25 breaks of the logic, each made on a copy: one for each fix of the first external review (16), and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 25. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Self-test**: 125 checks pass on macOS. A copy pushed to Linux passes 120, and Windows passes 117. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files.
+- **Mutation tests**: 37 breaks of the logic, each made on a copy: 16 for the fixes of the first external review, 12 for the fixes of the second, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 37. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
 - **Reinstall**: on macOS, a throwaway job installed twice with a custom state directory loaded, ran from `launchctl kickstart` with its record in that directory, and uninstalled. On Linux, a second install restarted the timer.
 - **Locks**: two real processes in the same minute with a shared lock never overlap, and the second waits and succeeds. The same pair without the lock overlaps, so the test can see the failure. This passes on all three OSes.
 - **Live runs on Linux and Windows**: a probe job installed, fired at its slot from systemd and from Task Scheduler, was disabled, enabled, fired again at the next slot, was started by hand and was uninstalled. `status -A` over three hosts took 3.6 seconds.
@@ -96,6 +98,7 @@ Not measured yet: a week of real jobs under launchd, a sleep and wake under laun
 
 - A step that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. takt has no step timeout.
 - On Windows, a killed wrapper releases its locks while its step can still run.
+- `--check` does not run the installers. They were tested by hand on macOS, Linux and Windows.
 - The Windows installer writes paths under the user profile as `%USERPROFILE%` in `takt.cmd`. A Python path with non-ASCII characters outside the profile stops the installer with an error. No account with a non-ASCII name has been tested.
 - A failed step is recorded. takt does not retry it.
 - `status` shows only the jobs in the jobs file. For a read-only view of every scheduled job on a machine, use the tools of the OS.
