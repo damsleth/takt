@@ -178,6 +178,9 @@ def _norm_step(s, sid):
 def normalize(jid, j) -> dict:
     if not ID_RE.match(jid):
         raise ValueError(f"job id {jid!r}: use letters, digits, - and _")
+    for name in j.get("lock", []):  # a lock name is a file name under <state>/locks
+        if not isinstance(name, str) or not ID_RE.match(name):
+            raise ValueError(f"job {jid}: lock name {name!r}: use letters, digits, - and _")
     steps = [_norm_step(s, f"step{i + 1}") for i, s in enumerate(j.get("step", []))]
     if "command" in j:
         steps = [_norm_step(j, "main")]
@@ -303,8 +306,8 @@ class Locks:
     """Named flocks, taken in sorted order so two jobs can never deadlock.
     flock dies with the last process holding it, so a crashed job cannot wedge the lock."""
 
-    def __init__(self, state: Path, names, timeout):
-        self.dir, self.names, self.timeout, self.fds, self.blocked_on = state / "locks", sorted(names), timeout, [], None
+    def __init__(self, state: Path, names, timeout, sub="locks"):
+        self.dir, self.names, self.timeout, self.fds, self.blocked_on = state / sub, sorted(names), timeout, [], None
 
     def __enter__(self):
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -598,10 +601,10 @@ def take_start(state: Path, jid):
 
 
 def job_running(state: Path, jid):
-    """A wrapper for this job is running: it holds `run-<id>` from its start, also while it waits
-    for a shared lock (`job-<id>` is taken only with the other locks, after the wait)."""
+    """A wrapper for this job is running: it holds `running/<id>` from its start, also while it
+    waits for a shared lock (`job-<id>` is taken only with the other locks, after the wait)."""
     try:
-        Locks(state, [f"run-{jid}"], 0).__enter__().__exit__()
+        Locks(state, [jid], 0, sub="running").__enter__().__exit__()
         return False
     except TimeoutError:
         return True
@@ -643,9 +646,9 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
         return 0
     marker = None
     try:
-        # run-<id> first: only this job's own wrapper takes it, and it holds nothing else while it
-        # waits for it, so it cannot deadlock. `takt start` reads it to see a waiting run.
-        marker = Locks(state, [f"run-{jid}"], job["lock_timeout"]).__enter__()
+        # running/<id> first: only this job's own wrapper takes it, and it holds nothing else while
+        # it waits for it, so it cannot deadlock. `takt start` reads it to see a waiting run.
+        marker = Locks(state, [jid], job["lock_timeout"], sub="running").__enter__()  # own dir: no lock name collides
         locks = Locks(state, names, job["lock_timeout"]).__enter__()
     except TimeoutError as e:
         if marker:
@@ -1724,6 +1727,7 @@ def self_check():
         check_review6(ok, tmp)
         check_review7(ok, tmp)
         check_review8(ok, tmp)
+        check_review9(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2641,7 +2645,7 @@ def check_review7(ok, tmp):
     specf = write_spec(d, mkjob("d", schedule="0 0 * * *", command=[PY, "-c", "pass"]))
     g, calls = globals(), []
     saved = g["run_admin"]
-    holder = Locks(d / "st", ["run-d"], 5).__enter__()
+    holder = Locks(d / "st", ["d"], 5, sub="running").__enter__()
     try:
         g["run_admin"] = lambda cmds: calls.append(cmds) or None
         out = io.StringIO()
@@ -2687,6 +2691,22 @@ def check_review8(ok, tmp):
     pj.communicate()
     ok(not job_running(d / "st", "j") and read_record(d / "st", "j")["status"] == "ok",
        "start: the marker is released when the run ends")
+
+
+def check_review9(ok, tmp):
+    """Regressions for the ninth external review (2026-10-04)."""
+    # the running marker has its own directory: a lock named like it does not wait on itself
+    d = tmp / "r9"
+    d.mkdir()
+    sp = {"j": mkjob("j", lock=["run-j", "j"], lock_timeout=1, command=[PY, "-c", "pass"])}
+    ok(run_job(sp, "j", d / "st", say=lambda *_: None) == 0 and read_record(d / "st", "j")["status"] == "ok",
+       "lock: a lock named like the job's running marker does not block the job")
+    for bad in ("../x", "a/b", "", 3):
+        try:
+            mkjob("x", lock=[bad])
+            ok(False, f"spec: lock name {bad!r} is rejected")
+        except ValueError:
+            ok(True, "")
 
 
 def check_windows_last(ok):

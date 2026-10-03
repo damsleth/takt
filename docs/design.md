@@ -22,7 +22,7 @@ takt has no daemon. A daemon can stop without notice, and that was one of the fa
 
 ## Locks
 
-Each run first takes `run-<id>`, which says "this job is running" (`takt start` reads it). Only the job's own wrapper takes it, and it holds nothing else while it waits for it, so it cannot deadlock. Then the run takes an exclusive lock on `<state>/locks/<name>.lock` for each name in its `lock` list. It also takes one lock for its own id, and the same locks for each `after` dependency. It takes the locks in sorted order, so two jobs cannot deadlock.
+Each run first takes `<state>/running/<id>.lock`, which says "this job is running" (`takt start` reads it). It has its own directory, so no lock name can collide with it. Only the job's own wrapper takes it, and it holds nothing else while it waits for it, so it cannot deadlock. Then the run takes an exclusive lock on `<state>/locks/<name>.lock` for each name in its `lock` list. It also takes one lock for its own id, and the same locks for each `after` dependency. It takes the locks in sorted order, so two jobs cannot deadlock.
 
 If a lock is held, the job waits. The record holds `waited_s` and `blocked_on`. After `lock_timeout` seconds the run ends as `lock-timeout` with exit code 75.
 
@@ -80,8 +80,8 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
 
-- **Self-test**: 169 checks pass on macOS. A copy pushed to Linux passes 164, and Windows passes 163. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
-- **Mutation tests**: 85 breaks of the logic, each made on a copy: 16, 12, 13, 8, 10, 7, 5 and 4 for the fixes of eight external reviews, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 85. The two job-object breaks ran on Windows. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Self-test**: 174 checks pass on macOS. A copy pushed to Linux passes 169, and Windows passes 168. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
+- **Mutation tests**: 87 breaks of the logic, each made on a copy: 16, 12, 13, 8, 10, 7, 5, 4 and 2 for the fixes of nine external reviews, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 87. The two job-object breaks ran on Windows. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
 - **Leftover processes on Windows**: a step started a background helper and returned while another job waited for the same lock. The helper's last write came 0.054 s before the waiting job started, and no helper was left running.
 - **Task Scheduler trigger limit**: a task with 48 triggers registered on Windows 11, and one with 49 was refused ("The task XML contains too many nodes of the same type").
 - **`takt start` off its slot**: a `catch_up = "skip"` job started at another time ran and recorded the trigger `start` on launchd, systemd and Task Scheduler. On Linux, removing its schedule and reinstalling retired the timer.
