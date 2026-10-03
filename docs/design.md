@@ -1,0 +1,109 @@
+# Design
+
+## The problem
+
+takt started from seven scheduling failures on one Mac in five days (2026-09-25 to 09-30). Each one became a requirement:
+
+| Failure | Requirement |
+|---|---|
+| A cron job took its name from the commented-out line above it. | Each job has a stable id in the file. |
+| An edit in a cron TUI made a second copy of the job. | Edits use the id. Enabled is job state, not a comment. |
+| The Mac slept for 2 days and cron ran nothing. | Each job has a catch-up rule. |
+| Two jobs used one browser profile at the same minute. The fix was a `:10` offset. | Jobs can share a lock and can run in order. |
+| A job failed on every run because Full Disk Access belonged to `/usr/sbin/cron`. | A preflight check names the binary that needs the grant. |
+| 3 sources failed on every run, and the only record was a JSON line in a log. | Each run records the status of each sub-step. |
+| A token expired because one profile was missing from a list. | A dependency can be a health check, not only a job. |
+
+## Shape
+
+One TOML file declares the jobs. The scheduler of the OS is the clock: launchd, systemd or Task Scheduler. Each scheduled entry runs `takt run <id>`, and the wrapper does the rest: locks, order, preflight, steps and the record.
+
+takt has no daemon. A daemon can stop without notice, and that was one of the failures. launchd runs a missed calendar slot once after wake, which cron does not do.
+
+## Locks
+
+Each run takes an exclusive lock on `<state>/locks/<name>.lock` for each name in its `lock` list. It also takes one lock for its own id, and the same locks for each `after` dependency. It takes the locks in sorted order, so two jobs cannot deadlock.
+
+If a lock is held, the job waits. The record holds `waited_s` and `blocked_on`. After `lock_timeout` seconds the run ends as `lock-timeout` with exit code 75.
+
+On macOS and Linux the lock is `flock`. On Windows it is `msvcrt.locking`. In both cases the OS releases the lock when the process ends, so a crashed job cannot hold a lock.
+
+## Ordering
+
+`after` pulls a dependency in, as `make` does. Job B has `after = ["A"]`. When B starts, it looks at the latest slot of A. If that slot is at or after the slot of B, and A has no record for it, B runs A first, under the locks that B holds. A is recorded under its own slot with `pulled_by = "B"`. When the scheduler starts A, A takes the lock, reads the record and exits.
+
+So A runs once and before B, in each order of start, with no timing assumptions.
+
+The lock alone stops the overlap. `after` adds the order: in the original case, the ingest must use the tokens that the refresh just wrote.
+
+## Catch-up
+
+`catch_up = "run-once"` is the behavior of the schedulers: after a sleep, one start for the missed slots. `catch_up = "skip"` is done by the wrapper: a scheduled start more than 5 minutes after its slot exits with 0 and runs nothing.
+
+After a long sleep, a pulled-in dependency is recorded under its own latest slot. Example: the Mac wakes at 15:33. The ingest (every 2 hours) has the 14:00 slot. The refresh (hourly) has the 15:00 slot. The ingest pulls in the refresh and records it under 15:00. The refresh then starts for 15:00, finds the record, and does not run a second time.
+
+## Status
+
+Each run writes one JSON record: slot, trigger, start time, duration, wait, status, and for each step the exit code, the duration and the failed sources. Steps run in order, and a failed step does not stop the next one, the same as `;` in a crontab line.
+
+`report = "json-failed-sources"` reads `error.failed_sources` from the last JSON line of a step. A step that exits with 0 and reports failed sources is `partial`.
+
+## Preflight
+
+`needs` skips the job and records the reason. `wants` records a warning and runs the job. The Full Disk Access check opens the protected file and names the binary that needs the grant: the interpreter in `[settings] python`, not the terminal.
+
+## Backends
+
+| Spec | launchd | systemd | Task Scheduler |
+|---|---|---|---|
+| `schedule` | `StartCalendarInterval`, one dict for each combination (`0 */2` gives 12 dicts). `* * * * *` gives `StartInterval 60`. | `OnCalendar` | `CalendarTrigger` with a `Repetition` for `*/n` minutes and hourly jobs, otherwise one trigger for each time. |
+| `catch_up = "run-once"` | built in | `Persistent=true` | `StartWhenAvailable` |
+| `run_at_load` | `RunAtLoad` | `OnActiveSec=5s` | `LogonTrigger` |
+| overlap | the wrapper locks | the wrapper locks | the wrapper locks, and `MultipleInstancesPolicy IgnoreNew` |
+| `PATH` | `EnvironmentVariables` | `Environment=PATH=` | inherited |
+
+`import-plist` reads a plist back into a job. `import-cron` reads a crontab. A commented-out cron line is never read as a job.
+
+## Measurements
+
+macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
+
+- **Self-test**: 96 checks pass on macOS. A copy pushed to Linux passes 91, and Windows passes 89. The copies skip the checks of `examples/`, and Windows skips the checks that need `chmod 000` and a shell script.
+- **Mutation tests**: 11 single-line breaks of the logic, each made on a copy of this version: ordering, systemd install and uninstall, Task Scheduler XML, argument checks for ssh, scheduler state, and `init`. The self-test fails on all 11. 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in the prototype.
+- **Locks**: two real processes in the same minute with a shared lock never overlap, and the second waits and succeeds. The same pair without the lock overlaps, so the test can see the failure. This passes on all three OSes.
+- **Live runs on Linux and Windows**: a probe job installed, fired at its slot from systemd and from Task Scheduler, was disabled, enabled, fired again at the next slot, was started by hand and was uninstalled. `status -A` over three hosts took 3.6 seconds.
+- **Real data on macOS**: `import-plist` read the real token-refresh plist, and `import-cron` read 12 crontab jobs. The rendered plists put every slot at minute 0.
+
+Found by the runs:
+
+- Windows appends to a file as a seek and a write. Two processes that append to one file at the same time overwrite lines. This broke a marker file in the self-test, not the lock.
+- `schtasks /Run` refuses a disabled task, and systemd starts it.
+- Rendered on the development shell, a plist got a temporary `fnm` directory in `PATH` and a versioned Homebrew path for Python. `[settings]` and `takt init` now pin both.
+- A token-expiry check called 2 profiles healthy while their refresh job needed an interactive sign-in. The expiry of a token does not show the health of its refresh.
+
+Not measured yet: a week of real jobs under launchd, a sleep and wake under launchd, and Full Disk Access when launchd starts the interpreter.
+
+## Limits
+
+- A step that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. takt has no step timeout.
+- A failed step is recorded. takt does not retry it.
+- `status` shows only the jobs in the jobs file. For a read-only view of every scheduled job on a machine, use the tools of the OS.
+- Only `push` and `install` copy `takt.py` to a host, so a host can run an older version.
+- Windows tasks run only while the user is logged on.
+
+## Not built
+
+Each item has the condition that would justify it.
+
+| Item | Build it when |
+|---|---|
+| A daemon or a runner that is always on | A job must run while logged out on macOS, or more often than each minute. |
+| Control of jobs that takt did not install | A job outside the jobs file must be started or toggled from the TUI. |
+| Retries and step timeouts | The first real hang or transient failure. |
+| Notifications | Someone picks the reader: a daily note, a task list or a push service. `status --json` is ready for it. |
+| A curses TUI | The TUI needs panes that fzf cannot show. |
+| Windows tasks that run while logged out | A Windows job must run at the login screen. This needs S4U or a stored password. |
+
+## Prior art
+
+[skdlr](https://github.com/byteowlz/skdlr) (Rust) schedules jobs on the same three backends, with a SQLite store, a TUI, an MCP server and an HTTP API. In its source there are no locks between jobs, no ordering, no preflight per job and no status per step. Those four are the requirements above. Its schtasks backend builds `/CREATE` arguments, which cannot express `0 */2`. takt writes Task Scheduler XML with repetition triggers. No code is copied: skdlr has no license.
