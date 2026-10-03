@@ -58,7 +58,7 @@ The login shell on the host can be `sh` or PowerShell, and ssh joins arguments w
 | Time zone | Each host uses its own clock. `NEXT` in `status -A` shows host time, so two hosts can show different times for the same slot. |
 | Uninstall a running job | launchd boots it out, systemd stops the service, Task Scheduler ends the task. The job's processes end with it. |
 | Start a disabled job | systemd starts the service. Task Scheduler refuses with "could not run because it is disabled". takt shows the error from the scheduler. |
-| Trigger in the record | A run from `takt start` shows the trigger `scheduled`, because the scheduler starts the same command as a timed run. |
+| Trigger in the record | A run from `takt start` records the trigger `start`. It runs whatever its slot, also with `catch_up = "skip"`. |
 | Missed slots | launchd and systemd (`Persistent=true`) run a missed slot once after wake. Task Scheduler does the same with `StartWhenAvailable`. |
 
 ## Remove a host
