@@ -493,6 +493,44 @@ def slot_of(job, now):
     return prev_slot(parse_cron(job["schedule"]), now)
 
 
+_JOB = None  # Windows: the job object; closing it (when this process ends) ends the steps
+
+
+def end_steps_with_wrapper():
+    """Windows: put this wrapper in a job object with KILL_ON_JOB_CLOSE. Its steps inherit the
+    job, so when the wrapper exits or is killed (`schtasks /End`, uninstall), the steps end with
+    it, as systemd (cgroup) and launchd (process group) already do. Without it, /End kills only
+    pythonw and the step runs on, unlocked. ponytail: best effort; a failure leaves the old
+    behavior."""
+    global _JOB
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateJobObjectW.restype = wintypes.HANDLE
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):
+        _fields_ = [("Basic", Basic), ("Io", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+    job = k32.CreateJobObjectW(None, None)
+    info = Extended()
+    info.Basic.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if job and k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)) \
+            and k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
+        _JOB = job  # kept open for the life of the process
+        return True
+    return False
+
+
 def pulled_for(state: Path, jid, slot):
     """The job already ran for this slot, pulled in by another job."""
     last = read_record(state, jid)
@@ -796,8 +834,10 @@ def split_steps(cmd):
     ($, `, globs, ~, braces), cron's % and a truncating > change meaning outside a shell."""
     if re.search(r"[$`*?\[{~]", cmd):
         raise ValueError("shell expansion")
-    if re.search(r"(^|\s)2\s+>>", cmd):  # `echo 2 >> f`: the 2 is an argument, only `2>>` is stderr
+    if re.search(r"(^|\s)(['\"]2['\"]\s*|2\s+)>>", cmd):  # `echo 2 >> f`, `echo "2">> f`: the 2 is an argument
         raise ValueError("ambiguous 2 before >>")
+    if re.search(r"['\"][;<>|&]|[;<>|&]['\"]", cmd):  # `echo ";"`: shlex drops the quotes that made it an argument
+        raise ValueError("quote next to an operator")
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     toks = list(lex)
@@ -993,11 +1033,13 @@ def plan_uninstall(ids, agents_dir: Path, be, nat):
                 acts.append(("run", ["launchctl", "bootout", f"gui/{_uid()}/{PREFIX}.{jid}"], None))
             acts.append(("rm", agents_dir / f"{PREFIX}.{jid}.plist", None))
         elif be == "systemd":
-            if inst:
+            if inst:  # the timer, then a run that is still going (stop kills the service's cgroup)
                 acts.append(("run", ["systemctl", "--user", "disable", "--now", f"takt-{jid}.timer"], None))
+                acts.append(("run", ["systemctl", "--user", "stop", f"takt-{jid}.service"], None))
             acts += [("rm", agents_dir / f"takt-{jid}.{x}", None) for x in ("timer", "service")]
         else:
-            if inst:
+            if inst:  # /Delete leaves a running instance alive; /End first (exit 0 when idle)
+                acts.append(("run", ["schtasks", "/End", "/TN", task_name(jid)], None))
                 acts.append(("run", ["schtasks", "/Delete", "/TN", task_name(jid), "/F"], None))
             acts.append(("rm", agents_dir / f"takt-{jid}.xml", None))
     if be == "systemd":
@@ -1074,9 +1116,13 @@ def native_query(be, ids):
         return ["launchctl", "list"]
     if be == "systemd":
         return ["systemctl", "--user", "show", "-p", "Id,LoadState,ActiveState", *[f"takt-{j}.timer" for j in ids]]
-    # State is an enum name (Ready/Running/Disabled), not localized text like schtasks /Query
-    return ["powershell", "-NoProfile", "-Command", "Get-ScheduledTask -TaskPath '\\takt\\' "
-            "-ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName + '|' + $_.State }"]
+    # State is an enum name (Ready/Running/Disabled), not localized text like schtasks /Query.
+    # No \takt\ folder yet is an empty list (exit 0); any other error exits 1, so a strict
+    # inventory can tell "no tasks" from "could not ask".
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "try { Get-ScheduledTask -TaskPath '\\takt\\' -ErrorAction Stop | ForEach-Object { $_.TaskName + '|' + $_.State } } "
+            "catch { if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*') { exit 0 }; "
+            "[Console]::Error.WriteLine($_); exit 1 }"]
 
 
 def parse_native(be, text, ids, agents_dir: Path):
@@ -1100,11 +1146,32 @@ def parse_native(be, text, ids, agents_dir: Path):
     return out
 
 
-def native_text(be, ids):
+def native_text(be, ids, strict=False, run=subprocess.run):
+    """The scheduler's own list of jobs. `status` tolerates a failed query. A plan that changes
+    the scheduler passes strict=True: there, "the query failed" must never read as "nothing is
+    registered", or uninstall would delete the files of a job that is still loaded."""
+    q = native_query(be, ids)
     try:
-        return subprocess.run(native_query(be, ids), capture_output=True, text=True, timeout=30, **NO_WINDOW).stdout
-    except (OSError, subprocess.SubprocessError):
+        r = run(q, capture_output=True, text=True, timeout=30, **NO_WINDOW)
+    except (OSError, subprocess.SubprocessError) as e:
+        if strict:
+            raise RuntimeError(f"cannot read the scheduler ({q[0]}): {e}") from e
         return ""
+    if strict and r.returncode != 0:
+        raise RuntimeError(f"cannot read the scheduler: {q[0]} exited {r.returncode}: {(r.stderr or '').strip()[:200]}")
+    return r.stdout
+
+
+def inventory(spec, be, agents_dir: Path, run=subprocess.run):
+    """(takt ids registered here, scheduler state) for install and uninstall. Strict."""
+    known = installed_ids(be, agents_dir, native_text(be, [], True, run) if be == "schtasks" else None)
+    ids = sorted(set(spec) | set(known))
+    return known, parse_native(be, native_text(be, ids, True, run), ids, agents_dir)
+
+
+def run_checked(argv, inp):
+    """The runner of a plan that changes the scheduler: a failed command stops the plan."""
+    return subprocess.run(argv, input=inp, check=True, **NO_WINDOW)
 
 
 def native_states(ids, be, agents_dir: Path):
@@ -1235,6 +1302,10 @@ def on_host(host, rest):
     cmdline = remote_argv(host, rest)  # validate every argument before push writes anything
     cmd, writes = (rest[0] if rest else ""), "--allow-writes" in rest
     if cmd in ("push", "install"):
+        try:
+            build_parser().parse_args(rest)  # a typo fails here, before the host is changed
+        except SystemExit as e:
+            return e.code or 0
         if not writes:
             print(f"PLAN push {Path(__file__).name} to {host}:{REMOTE_DIR}/ and jobs.{host}.toml to "
                   f"{host}:.config/takt/jobs.toml", flush=True)
@@ -1321,14 +1392,7 @@ def make_ctx(a):
             "path": cfg.get("path") or os.environ.get("PATH", DEFAULT_PATH), "state": str(state_dir(a))}
 
 
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else list(argv)
-    if argv[:1] == ["--host"] and len(argv) > 1:
-        if argv[1] != "local":
-            return on_host(argv[1], argv[2:])
-        argv = argv[2:]
-    if not argv and sys.stdin.isatty() and sys.stdout.isatty():
-        return ui(False)
+def build_parser():
     ap = argparse.ArgumentParser(prog="takt", description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true", help="offline self-test")
     ap.add_argument("--version", action="version", version=f"takt {__version__}")
@@ -1369,8 +1433,21 @@ def main(argv=None):
             ins.add_argument("ids", nargs="*", help="default: every job in the spec")
         ins.add_argument("--allow-writes", action="store_true")
         ins.add_argument("--agents-dir", help="LaunchAgents / systemd user unit dir (default per OS)")
-    sub.add_parser("push", help="with --host H: copy takt.py and jobs.H.toml to H")
+    sub.add_parser("push", help="with --host H: copy takt.py and jobs.H.toml to H").add_argument(
+        "--allow-writes", action="store_true")
     common(sub.add_parser("init", help="write a starter jobs.toml (never overwrites)"))
+    return ap
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["--host"] and len(argv) > 1:
+        if argv[1] != "local":
+            return on_host(argv[1], argv[2:])
+        argv = argv[2:]
+    if not argv and sys.stdin.isatty() and sys.stdout.isatty():
+        return ui(False)
+    ap = build_parser()
     a = ap.parse_args(argv)
 
     if a.check:
@@ -1386,6 +1463,8 @@ def main(argv=None):
         if a.id not in spec:
             sys.exit(f"unknown job {a.id!r}; have: {', '.join(spec)}")
         now = datetime.fromisoformat(a.now) if a.now else None
+        if os.name == "nt" and not a.dry_run:
+            end_steps_with_wrapper()
         return run_job(spec, a.id, state_dir(a), now, a.scheduled, a.dry_run)
     be = backend()
     adir = Path(getattr(a, "agents_dir", None) or default_dir(be, state_dir(a)))
@@ -1445,8 +1524,11 @@ def main(argv=None):
         return 0
     if a.cmd in ("install", "uninstall"):
         spec = load_spec(a.spec)
-        known = installed_ids(be, adir)
-        nat = native_states(sorted(set(spec) | set(known)), be, adir)
+        try:
+            known, nat = inventory(spec, be, adir)
+        except RuntimeError as e:
+            print(f"failed: {e}. Nothing changed.", file=sys.stderr)
+            return 1
         acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
                           ctx=make_ctx(a) if a.cmd == "install" else None,
                           crontab=read_crontab(spec) if a.cmd == "install" else "")
@@ -1456,7 +1538,7 @@ def main(argv=None):
             print("\nnothing written. Re-run with --allow-writes to perform the plan above.")
             return 0
         try:
-            apply_plan(acts, lambda argv_, inp: subprocess.run(argv_, input=inp, check=True, **NO_WINDOW))
+            apply_plan(acts, run_checked)
         except subprocess.CalledProcessError as e:
             print(f"failed: {' '.join(e.cmd)} exited {e.returncode}. Stopped; the steps after it did not run.",
                   file=sys.stderr)
@@ -1486,6 +1568,7 @@ def self_check():
         check_admin(ok, tmp)
         check_review(ok, tmp)
         check_review2(ok, tmp)
+        check_review3(ok, tmp)
         check_examples(ok, tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1885,8 +1968,10 @@ def check_admin(ok, tmp):
        "install systemd: units written, daemon-reload, then enable and restart (a reinstall takes effect)")
     calls = []
     apply_plan(plan_uninstall(["a"], ud, "systemd", {"a": (True, True)}), lambda a, i: calls.append(a))
-    ok(calls == [["systemctl", "--user", "disable", "--now", "takt-a.timer"], ["systemctl", "--user", "daemon-reload"]]
-       and not (ud / "takt-a.timer").exists() and (ud / "takt-b.timer").exists(), "uninstall systemd: stops, removes only that job")
+    ok(calls == [["systemctl", "--user", "disable", "--now", "takt-a.timer"], ["systemctl", "--user", "stop", "takt-a.service"],
+                 ["systemctl", "--user", "daemon-reload"]]
+       and not (ud / "takt-a.timer").exists() and (ud / "takt-b.timer").exists(),
+       "uninstall systemd: stops the timer and a running service, removes only that job")
     xd, calls = tmp / "xml", []
     apply_plan(plan_install({"a": spec["a"]}, {**ctx, "python": "C:\\Py\\python.exe"}, xd, "", "schtasks"),
                lambda a, i: calls.append(a))
@@ -2002,6 +2087,21 @@ def check_review(ok, tmp):
         except ValueError:
             ok(True, "")
 
+    # Windows: a killed wrapper takes its step with it (job object), so no step runs unlocked
+    if os.name == "nt":
+        d = tmp / "winjob"
+        d.mkdir()
+        mk = d / "m.txt"
+        spec = write_spec(d, mkjob("a", lock=["res"], command=cmd_mark(mk, "a", 2.5)))
+        pa = spawn(spec, d / "st", "a")
+        time.sleep(1.0)
+        pa.kill()
+        pa.wait()
+        pa.stdout.close()
+        time.sleep(2.5)
+        ev = marks(mk)
+        ok("start" in ev.get("a", {}) and "end" not in ev["a"], "lock (windows): killing the wrapper ends its step")
+
     # a killed wrapper does not free a lock its running step still uses (POSIX: inherited fds)
     if fcntl:
         d = tmp / "orphan"
@@ -2113,6 +2213,74 @@ def check_review2(ok, tmp):
         ok(False, "remote: a bad argument is refused before the push")
     except ValueError:
         ok(pushed == [], "remote: a bad argument is refused before the push")
+    finally:
+        g["CONFIG"], g["push"] = saved
+
+
+def check_review3(ok, tmp):
+    """Regressions for the third external review (2026-10-03), and checks the second one lacked."""
+    import contextlib
+    import io
+    # a failed scheduler query stops install/uninstall; status still tolerates it
+    def failed(*a, **k):
+        return subprocess.CompletedProcess(a[0], 1, "", "no user bus")
+
+    def broken(*a, **k):
+        raise FileNotFoundError("systemctl")
+    for be, run in (("systemd", failed), ("schtasks", failed), ("launchd", broken)):
+        try:
+            inventory({"x": mkjob("x")}, be, tmp, run)
+            ok(False, f"inventory: a failed {be} query stops the plan")
+        except RuntimeError:
+            ok(True, "")
+    ok(native_text("schtasks", [], run=broken) == "", "status: a failed scheduler query still shows the table")
+
+    # uninstall and retirement stop running work: the systemd service, the running Windows task
+    nat = {"old": (True, True)}
+    un_sd = plan_admin("uninstall", {}, "systemd", tmp / "r3u", ["old"], nat)
+    ok([a[2:4] for k, a, _ in un_sd if k == "run"][:2] == [["disable", "--now"], ["stop", "takt-old.service"]],
+       "uninstall systemd: stops the running service as well as the timer")
+    re_sd = plan_admin("install", {"new": mkjob("new", schedule="0 * * * *")}, "systemd", tmp / "r3u", ["old"], nat,
+                       ctx={**CTX, "state": str(tmp / "r3st")})
+    ok([a[2:4] for k, a, _ in re_sd if k == "run"][:2] == [["disable", "--now"], ["stop", "takt-old.service"]]
+       and any(k == "write" and Path(a).name == "takt-new.timer" for k, a, _ in re_sd),
+       "install systemd: retires a job the spec no longer names, then installs the spec")
+    re_win = plan_admin("install", {"new": mkjob("new", schedule="0 * * * *")}, "schtasks", tmp / "r3x", ["old"], nat,
+                        ctx={**CTX, "state": str(tmp / "r3st")})
+    runs = [a[:3] for k, a, _ in re_win if k == "run"]
+    ok(runs[:2] == [["schtasks", "/End", "/TN"], ["schtasks", "/Delete", "/TN"]] and runs[2][:2] == ["schtasks", "/Create"],
+       "install schtasks: ends a running instance, deletes the old task, then creates the new one")
+
+    # the production runner checks exit codes
+    try:
+        run_checked([PY, "-c", "import sys; sys.exit(3)"], None)
+        ok(False, "runner: a failed scheduler command raises")
+    except subprocess.CalledProcessError:
+        ok(True, "")
+
+    # one temp file per writer: a stale fixed-name temp entry cannot block a write
+    st = tmp / "r3tmp"
+    (st / ".a.json.tmp").mkdir(parents=True)
+    write_record(st, {"id": "a", "status": "ok"})
+    ok(read_record(st, "a")["status"] == "ok", "record: written through a temp file of its own")
+
+    # cron import: a quoted 2 before >>, and a quoted operator
+    jobs, _, _ = import_cron("0 1 * * * echo \"2\">> /tmp/log\n0 2 * * * echo \";\"\n0 3 * * * echo '2' >> /tmp/log\n")
+    ok([j["steps"][0]["command"][:2] for j in jobs] == [["/bin/sh", "-c"]] * 3,
+       "import: a quoted 2 before >> and a quoted ; stay in sh -c")
+
+    # --host install: a typo in the command fails locally, before push
+    g, pushed = globals(), []
+    saved = g["CONFIG"], g["push"]
+    g["CONFIG"], g["push"] = tmp, (lambda h: pushed.append(h) or 0)
+    (tmp / "jobs.h3.toml").write_text('[settings]\npython = "python3"\n')
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = g["on_host"]("h3", ["install", "--bogus", "--allow-writes"])
+        ok(code == 2 and pushed == [], "remote: an unknown option fails before the push")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = g["on_host"]("h3", ["push", "--allow-writes"])
+        ok(code == 0 and pushed == ["h3"], "remote: a valid push passes the local parse and pushes")
     finally:
         g["CONFIG"], g["push"] = saved
 
