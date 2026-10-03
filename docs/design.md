@@ -30,7 +30,7 @@ On macOS and Linux the lock is `flock`. Each step inherits the open lock files, 
 
 A process that the step starts keeps the lock only if it inherits the lock files. A shell `&` keeps them open. Python's `subprocess` closes them by default (`close_fds=True`), so a Python step that starts a background process does not protect that process with the lock. A background process that keeps the lock files holds the lock until it exits.
 
-On Windows the lock is `msvcrt.locking`, and it ends with the wrapper process. The wrapper runs in a job object that ends its steps when the wrapper exits or is killed, so a step never runs without its lock. Before the wrapper releases its locks, it ends the other processes in its job, so a helper that a step left running cannot run without the lock either. If takt cannot create the job object, it does not run the job, and the record says why.
+On Windows the lock is `msvcrt.locking`, and it ends with the wrapper process. The wrapper runs in a job object that ends its steps when the wrapper exits or is killed, so a step never runs without its lock. Before the wrapper releases its locks, it ends the other processes in its job and waits for each one to exit, so a helper that a step left running cannot run without the lock either. If takt cannot create the job object, it does not run the job, and the record says why.
 
 Processes that a step leaves running end with the job on every scheduler: systemd stops the service's cgroup, launchd ends the job's process group, and on Windows the job object closes.
 
@@ -80,9 +80,10 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
 
-- **Self-test**: 145 checks pass on macOS. A copy pushed to Linux passes 140, and Windows passes 138. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
-- **Mutation tests**: 59 breaks of the logic, each made on a copy: 16, 12, 13 and 8 for the fixes of four external reviews, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 59. The job-object break ran on Windows. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Self-test**: 152 checks pass on macOS. A copy pushed to Linux passes 147, and Windows passes 146. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
+- **Mutation tests**: 69 breaks of the logic, each made on a copy: 16, 12, 13, 8 and 10 for the fixes of five external reviews, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 69. The two job-object breaks ran on Windows. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
 - **Leftover processes on Windows**: a step started a background helper and returned while another job waited for the same lock. The helper's last write came 0.054 s before the waiting job started, and no helper was left running.
+- **Manual-only job on Linux**: a job with no schedule installed as a systemd service with no timer, ran from `takt start`, and uninstalled.
 - **Uninstall of a running job**: a job that was running at uninstall was gone afterwards on launchd, systemd and Task Scheduler (1 process before, 0 after). On Linux with no user bus, `uninstall` refused, exited with 1 and kept the unit files.
 - **Reinstall**: on macOS, a throwaway job installed twice with a custom state directory loaded, ran from `launchctl kickstart` with its record in that directory, and uninstalled. On Linux, a second install restarted the timer.
 - **Locks**: two real processes in the same minute with a shared lock never overlap, and the second waits and succeeds. The same pair without the lock overlaps, so the test can see the failure. This passes on all three OSes.
