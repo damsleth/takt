@@ -31,6 +31,8 @@ Only `push` and `install` copy files. Other commands run the copy that is on the
 
 ## Argument rules
 
+The host name must be an ssh alias: letters, digits and `. _ @ -`, with no `-` at the start.
+
 The login shell on the host can be `sh` or PowerShell, and ssh joins arguments with spaces. So takt sends no quotes. Every argument after `--host <host>` must be a plain word: letters, digits and `. / : \ = , @ + - _`. takt refuses other arguments before it starts ssh.
 
 ## Linux hosts

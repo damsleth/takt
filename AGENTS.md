@@ -16,7 +16,7 @@ docs/            cli.md, jobs.md, hosts.md, design.md
 
 - **One file, stdlib only.** The installers and `--host` copy `takt.py` alone. A second module or a dependency breaks both.
 - **Python 3.11 or later**, on macOS, Linux and Windows. Guard OS-specific code (`fcntl`, `os.getuid`, `chmod`) and test it on Windows.
-- **Writes need `--allow-writes`.** Each command that changes a machine prints its plan without the flag. The TUI action keys exist only under `takt ui --allow-writes`.
+- **Scheduler and host changes need `--allow-writes`.** `install`, `uninstall`, `push`, `start`, `enable` and `disable` print their plan without the flag. The TUI action keys exist only under `takt ui --allow-writes`.
 - **Nothing is quoted over ssh.** Forwarded arguments must match `SAFE_ARG`. Do not add quoting: the login shell can be `sh` or PowerShell.
 
 ## Gate

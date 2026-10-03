@@ -26,7 +26,11 @@ Each run takes an exclusive lock on `<state>/locks/<name>.lock` for each name in
 
 If a lock is held, the job waits. The record holds `waited_s` and `blocked_on`. After `lock_timeout` seconds the run ends as `lock-timeout` with exit code 75.
 
-On macOS and Linux the lock is `flock`. On Windows it is `msvcrt.locking`. In both cases the OS releases the lock when the process ends, so a crashed job cannot hold a lock.
+On macOS and Linux the lock is `flock`. Each step inherits the open lock files, and `flock` belongs to the open file, so the lock stays held until the wrapper and the step have both exited. If something kills the wrapper alone, its running step keeps the lock, and the next job waits for the step. When the last process exits, the OS releases the lock, so a crashed job cannot hold it.
+
+A step that starts a background process passes the lock files to that process too. The lock then stays held while the background process runs. Close inherited file descriptors in such a step, or run the background process outside takt.
+
+On Windows the lock is `msvcrt.locking`. It ends with the wrapper process: if something kills the wrapper alone, a step that still runs no longer holds the lock.
 
 ## Ordering
 
@@ -34,11 +38,15 @@ On macOS and Linux the lock is `flock`. On Windows it is `msvcrt.locking`. In bo
 
 So A runs once and before B, in each order of start, with no timing assumptions.
 
+B checks its own `needs` and `wants` after A has run and after B holds its locks. A can make a check of B pass, for example by refreshing a token that B needs. A dependency with `catch_up = "skip"` is not pulled in when its slot is more than 5 minutes old.
+
 The lock alone stops the overlap. `after` adds the order: in the original case, the ingest must use the tokens that the refresh just wrote.
 
 ## Catch-up
 
 `catch_up = "run-once"` is the behavior of the schedulers: after a sleep, one start for the missed slots. `catch_up = "skip"` is done by the wrapper: a scheduled start more than 5 minutes after its slot exits with 0 and runs nothing.
+
+The slot of a run is the latest scheduled time at or before the start. takt searches day by day across 8 years, so a yearly job woken months late finds its real slot. A schedule that never matches a date is rejected when the file loads.
 
 After a long sleep, a pulled-in dependency is recorded under its own latest slot. Example: the Mac wakes at 15:33. The ingest (every 2 hours) has the 14:00 slot. The refresh (hourly) has the 15:00 slot. The ingest pulls in the refresh and records it under 15:00. The refresh then starts for 15:00, finds the record, and does not run a second time.
 
@@ -68,8 +76,9 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
 
-- **Self-test**: 96 checks pass on macOS. A copy pushed to Linux passes 91, and Windows passes 89. The copies skip the checks of `examples/`, and Windows skips the checks that need `chmod 000` and a shell script.
-- **Mutation tests**: 11 single-line breaks of the logic, each made on a copy of this version: ordering, systemd install and uninstall, Task Scheduler XML, argument checks for ssh, scheduler state, and `init`. The self-test fails on all 11. 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in the prototype.
+- **Self-test**: 113 checks pass on macOS. A copy pushed to Linux passes 108, and Windows passes 105. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files.
+- **Mutation tests**: 25 breaks of the logic, each made on a copy: one for each fix of the first external review (16), and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 25. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Reinstall**: on macOS, a throwaway job installed twice with a custom state directory loaded, ran from `launchctl kickstart` with its record in that directory, and uninstalled. On Linux, a second install restarted the timer.
 - **Locks**: two real processes in the same minute with a shared lock never overlap, and the second waits and succeeds. The same pair without the lock overlaps, so the test can see the failure. This passes on all three OSes.
 - **Live runs on Linux and Windows**: a probe job installed, fired at its slot from systemd and from Task Scheduler, was disabled, enabled, fired again at the next slot, was started by hand and was uninstalled. `status -A` over three hosts took 3.6 seconds.
 - **Real data on macOS**: `import-plist` read the real token-refresh plist, and `import-cron` read 12 crontab jobs. The rendered plists put every slot at minute 0.
@@ -86,6 +95,8 @@ Not measured yet: a week of real jobs under launchd, a sleep and wake under laun
 ## Limits
 
 - A step that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. takt has no step timeout.
+- On Windows, a killed wrapper releases its locks while its step can still run.
+- The Windows installer writes paths under the user profile as `%USERPROFILE%` in `takt.cmd`. A Python path with non-ASCII characters outside the profile stops the installer with an error. No account with a non-ASCII name has been tested.
 - A failed step is recorded. takt does not retry it.
 - `status` shows only the jobs in the jobs file. For a read-only view of every scheduled job on a machine, use the tools of the OS.
 - Only `push` and `install` copy `takt.py` to a host, so a host can run an older version.

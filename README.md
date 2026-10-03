@@ -29,7 +29,7 @@ takt install --allow-writes   # register the jobs with the scheduler of this OS
 takt                          # open the TUI (needs fzf)
 ```
 
-Edit `~/.config/takt/jobs.toml` between `init` and `install`. Every command that changes a machine needs `--allow-writes`. Without it, takt shows the plan and stops.
+Edit `~/.config/takt/jobs.toml` between `init` and `install`. The commands that change the scheduler or another host (`install`, `uninstall`, `push`, `start`, `enable`, `disable`) need `--allow-writes`. Without it, they show the plan and stop. `run` executes a job at once, `init` writes a new jobs file, and `render` writes files to a folder.
 
 ## Examples
 
