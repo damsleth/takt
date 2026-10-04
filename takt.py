@@ -1470,6 +1470,18 @@ def push(host):
                                f"{host}:"]).returncode
 
 
+def stale_plan_note(host):
+    """A dry-run `--host H install` pushes nothing, so H plans from its current jobs.toml. When the
+    local jobs.<host>.toml declares other jobs, say so: that plan is not what --allow-writes installs."""
+    local = set(tomllib.loads((CONFIG / f"jobs.{host}.toml").read_text()).get("job", {}))
+    remote = {r["id"] for r in remote_rows(host) if r.get("id") not in (None, "-")}
+    if local == remote:
+        return None
+    return (f"NOTE the plan below comes from {host}'s current jobs.toml, because nothing is pushed yet. "
+            f"jobs.{host}.toml adds {', '.join(sorted(local - remote)) or 'nothing'} and drops "
+            f"{', '.join(sorted(remote - local)) or 'nothing'}; --allow-writes pushes it and installs that.")
+
+
 def on_host(host, rest):
     """`takt --host H <cmd> ...`: H's own copy of takt runs the command, so units are rendered
     with H's paths and the scheduler is H's. install also pushes; push is gated like install."""
@@ -1484,6 +1496,9 @@ def on_host(host, rest):
         if not writes:
             print(f"PLAN push {Path(__file__).name} to {host}:{REMOTE_DIR}/ and jobs.{host}.toml to "
                   f"{host}:.config/takt/jobs.toml", flush=True)
+            note = stale_plan_note(host) if cmd == "install" else None
+            if note:
+                print(note, flush=True)
         elif push(host):
             return 1
         if cmd == "push":
@@ -2573,8 +2588,26 @@ def check_review3(ok, tmp):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = g["on_host"]("h3", ["push", "--allow-writes"])
         ok(code == 0 and pushed == ["h3"], "remote: a valid push passes the local parse and pushes")
+        # dry-run install plans from the host's old spec: the note must say what will change
+        (tmp / "jobs.h3.toml").write_text('[settings]\npython = "python3"\n[job.web]\ncommand = ["true"]\n')
+        import types
+        rows, run = g["remote_rows"], subprocess.run
+        g["remote_rows"] = lambda h, cfg=None: [{"host": h, "id": "probe"}]
+        subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            g["on_host"]("h3", ["install"])
+        ok("NOTE" in out.getvalue() and "adds web" in out.getvalue() and "drops probe" in out.getvalue() and pushed == ["h3"],
+           "remote: a dry-run install names the jobs the pushed spec adds and drops")
+        g["remote_rows"] = lambda h, cfg=None: [{"host": h, "id": "web"}]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            g["on_host"]("h3", ["install"])
+        ok("NOTE" not in out.getvalue(), "remote: no note when the host already has the same jobs")
     finally:
         g["CONFIG"], g["push"] = saved
+        if "rows" in locals():
+            g["remote_rows"], subprocess.run = rows, run
 
 
 def check_review4(ok, tmp):
