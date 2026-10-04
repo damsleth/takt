@@ -35,6 +35,10 @@ The host name must be an ssh alias: letters, digits and `. _ @ -`, with no `-` a
 
 The login shell on the host can be `sh` or PowerShell, and ssh joins arguments with spaces. So takt sends no quotes. Every argument after `--host <host>` must be a plain word: letters, digits and `. / : \ = , @ + - _`. takt refuses other arguments before it starts ssh.
 
+## Web dashboard on a host
+
+A host named in `[settings] web` also gets a web service from `install`. It pulls the rows of the other devices over ssh, so it needs ssh access to each of them. See [web.md](web.md#ssh-from-the-web-device).
+
 ## Linux hosts
 
 - Jobs install as systemd user units: `~/.config/systemd/user/takt-<id>.service` and `.timer`.

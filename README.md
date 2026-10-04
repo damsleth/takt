@@ -29,6 +29,8 @@ takt install --allow-writes   # register the jobs with the scheduler of this OS
 takt                          # open the TUI (needs fzf)
 ```
 
+To serve a dashboard on a device of your tailnet, add `web = ["myvps"]` to `[settings]` and install on that device. Setup starts the server there. See [Web dashboard](docs/web.md).
+
 Edit `~/.config/takt/jobs.toml` between `init` and `install`. The commands that change the scheduler or another host (`install`, `uninstall`, `push`, `start`, `enable`, `disable`) need `--allow-writes`. Without it, they show the plan and stop. `run` executes a job at once, `init` writes a new jobs file, and `render` writes files to a folder.
 
 ## Examples
@@ -70,6 +72,7 @@ kwin   probe         on     ok      10-02 22:10  10-02 22:15
 
 - [Commands](docs/cli.md): every command, the TUI keys, environment variables.
 - [Jobs file](docs/jobs.md): all keys, schedules, preflight checks, status values.
+- [Web dashboard](docs/web.md): `takt web`, which devices serve it, ssh setup.
 - [Hosts](docs/hosts.md): other hosts over ssh, Linux and Windows setup.
 - [Design](docs/design.md): how locks, ordering, catch-up and status work, and the measurements.
 - [Security](SECURITY.md): what takt trusts, and how to report a problem.

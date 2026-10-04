@@ -9,7 +9,7 @@ takt.py          the whole tool: one file, Python 3.11+ stdlib only
 install.sh       curl | sh installer (macOS, Linux)
 install.ps1      irm | iex installer (Windows)
 examples/        jobs files; the self-test loads and checks them
-docs/            cli.md, jobs.md, hosts.md, design.md
+docs/            cli.md, jobs.md, hosts.md, web.md, design.md
 ```
 
 ## Contract
