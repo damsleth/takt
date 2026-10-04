@@ -1117,7 +1117,8 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", l
                 if (loaded is None or arg in loaded) and arg not in booted:  # once, if two jobs replace it
                     booted.add(arg)
                     acts.append(("run" if loaded is not None else "try", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
-                acts.append(("move", old, Path(ctx["state"]) / "retired" / old.name))
+                if old.exists():  # already retired by an earlier install: nothing to move, so plan nothing
+                    acts.append(("move", old, Path(ctx["state"]) / "retired" / old.name))
             elif kind == "cron":
                 for k, line in enumerate(new_cron):
                     if not line.lstrip().startswith("#") and arg in line:
@@ -2604,6 +2605,15 @@ def check_review3(ok, tmp):
         with contextlib.redirect_stdout(out):
             g["on_host"]("h3", ["install"])
         ok("NOTE" not in out.getvalue(), "remote: no note when the host already has the same jobs")
+        # replaces: a plist that an earlier install already retired must not show up as a move
+        la2, rspec = tmp / "hp-la", {"n": mkjob("n", schedule="0 * * * *", replaces=["launchd:com.example.gone"])}
+        la2.mkdir(exist_ok=True)
+        rctx = {**CTX, "state": str(tmp / "hp-st")}
+        acts = plan_install(rspec, rctx, la2, "", "launchd", set())
+        ok(not any(a[0] == "move" for a in acts), "install launchd: an already-retired replaces plist plans no move")
+        (la2 / "com.example.gone.plist").write_text("x")
+        acts = plan_install(rspec, rctx, la2, "", "launchd", set())
+        ok(any(a[0] == "move" for a in acts), "install launchd: an existing replaces plist is still moved")
     finally:
         g["CONFIG"], g["push"] = saved
         if "rows" in locals():
