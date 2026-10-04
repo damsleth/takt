@@ -56,6 +56,14 @@ RANGES = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
 ALIASES = {"@hourly": "0 * * * *", "@daily": "0 0 * * *", "@weekly": "0 0 * * 0",
            "@monthly": "0 0 1 * *"}
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# Windows device names: `NUL.lock` is the null device, not a file. Rejected everywhere, so a jobs
+# file stays valid on every OS.
+RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+
+
+def file_name_ok(name):
+    """A job id or lock name becomes a file name: plain characters, no Windows device name."""
+    return isinstance(name, str) and bool(ID_RE.match(name)) and name.lower() not in RESERVED
 NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
 
 
@@ -176,11 +184,11 @@ def _norm_step(s, sid):
 
 
 def normalize(jid, j) -> dict:
-    if not ID_RE.match(jid):
-        raise ValueError(f"job id {jid!r}: use letters, digits, - and _")
+    if not file_name_ok(jid):
+        raise ValueError(f"job id {jid!r}: use letters, digits, - and _, and no Windows device name (CON, NUL, COM1)")
     for name in j.get("lock", []):  # a lock name is a file name under <state>/locks
-        if not isinstance(name, str) or not ID_RE.match(name):
-            raise ValueError(f"job {jid}: lock name {name!r}: use letters, digits, - and _")
+        if not file_name_ok(name):
+            raise ValueError(f"job {jid}: lock name {name!r}: use letters, digits, - and _, and no Windows device name")
     steps = [_norm_step(s, f"step{i + 1}") for i, s in enumerate(j.get("step", []))]
     if "command" in j:
         steps = [_norm_step(j, "main")]
@@ -202,6 +210,8 @@ def normalize(jid, j) -> dict:
 def load_spec(path) -> dict:
     raw = tomllib.loads(Path(path).read_text())
     spec = {jid: normalize(jid, j) for jid, j in raw.get("job", {}).items()}
+    if len({j.lower() for j in spec}) != len(spec):  # records, markers and units would share a file
+        raise ValueError("two job ids differ only by case: " + ", ".join(sorted(spec)))
     for j in spec.values():
         for a in j["after"]:
             if a not in spec:
@@ -307,7 +317,10 @@ class Locks:
     flock dies with the last process holding it, so a crashed job cannot wedge the lock."""
 
     def __init__(self, state: Path, names, timeout, sub="locks"):
-        self.dir, self.names, self.timeout, self.fds, self.blocked_on = state / sub, sorted(names), timeout, [], None
+        # lowercase: on macOS and Windows "JOB-j" and "job-j" are one file, and taking it twice would
+        # wait on itself
+        self.dir, self.names, self.timeout, self.fds, self.blocked_on = (
+            state / sub, sorted({n.lower() for n in names}), timeout, [], None)
 
     def __enter__(self):
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -1728,6 +1741,7 @@ def self_check():
         check_review7(ok, tmp)
         check_review8(ok, tmp)
         check_review9(ok, tmp)
+        check_review10(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2707,6 +2721,29 @@ def check_review9(ok, tmp):
             ok(False, f"spec: lock name {bad!r} is rejected")
         except ValueError:
             ok(True, "")
+
+
+def check_review10(ok, tmp):
+    """Regressions for the tenth external review (2026-10-04)."""
+    d = tmp / "r10"
+    d.mkdir()
+    sp = {"j": mkjob("j", lock=["JOB-j", "Res", "res"], lock_timeout=1, command=[PY, "-c", "pass"])}
+    ok(run_job(sp, "j", d / "st", say=lambda *_: None) == 0 and read_record(d / "st", "j")["status"] == "ok",
+       "lock: names that differ only by case are one lock, not a wait on itself")
+    for bad_id, bad_lock in (("NUL", None), ("com1", None), (None, "Con"), (None, "lpt9")):
+        try:
+            mkjob(bad_id or "x", lock=[bad_lock] if bad_lock else [])
+            ok(False, f"spec: Windows device name {bad_id or bad_lock!r} is rejected")
+        except ValueError:
+            ok(True, "")
+    ok(file_name_ok("console") and file_name_ok("com10"), "spec: names that only start like a device name are fine")
+    f = d / "jobs.toml"
+    f.write_text('[job.A]\ncommand = ["true"]\n[job.a]\ncommand = ["true"]\n')
+    try:
+        load_spec(f)
+        ok(False, "spec: job ids that differ only by case are rejected")
+    except ValueError:
+        ok(True, "")
 
 
 def check_windows_last(ok):
