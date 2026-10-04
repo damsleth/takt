@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -1453,25 +1454,30 @@ def fmt_rows(rows):
     return ["  ".join(c.ljust(w[i]) if i < 6 else c for i, c in enumerate(row)).rstrip() for row in t]
 
 
+def format_record(jid, r):
+    """The text of one record: status line, steps, notes, preflight."""
+    if not r:
+        return f"{jid}: never run"
+    out = [f"{jid}  {r.get('status')}  started {r.get('started')}  {r.get('duration_s')}s  slot {r.get('slot')}  "
+           f"{r.get('trigger')}" + (f" by {r['pulled_by']}" if r.get("pulled_by") else "")]
+    if r.get("note"):
+        out.append(f"  note: {r['note']}")
+    for s in r.get("steps", []):
+        out.append(f"  step {s.get('id', ''):14} {s.get('status', ''):8} exit {s.get('exit')}  {s.get('duration_s')}s"
+                   + (f"  failed: {', '.join(s['failed'])}" if s.get("failed") else "")
+                   + (f"  note: {s['note']}" if s.get("note") else ""))
+    for p in r.get("preflight", []):
+        out.append(f"  {'needs' if p.get('hard') else 'wants'} {p.get('need', ''):12} "
+                   f"{'ok' if p.get('ok') else 'MISSING'}  {p.get('detail', '')}")
+    return "\n".join(out)
+
+
 def show(spec, state, jid):
     """Last record of one job and the tail of its logs: the TUI preview."""
     if jid not in spec:
         print(f"no job {jid!r} here")
         return 1
-    r = read_record(state, jid)
-    if not r:
-        print(f"{jid}: never run")
-    else:
-        print(f"{jid}  {r['status']}  started {r['started']}  {r['duration_s']}s  slot {r['slot']}  {r['trigger']}"
-              + (f" by {r['pulled_by']}" if r.get("pulled_by") else ""))
-        if r.get("note"):
-            print(f"  note: {r['note']}")
-        for s in r["steps"]:
-            print(f"  step {s['id']:14} {s['status']:8} exit {s['exit']}  {s['duration_s']}s"
-                  + (f"  failed: {', '.join(s['failed'])}" if s["failed"] else "")
-                  + (f"  note: {s['note']}" if s.get("note") else ""))
-        for p in r.get("preflight", []):
-            print(f"  {'needs' if p['hard'] else 'wants'} {p['need']:12} {'ok' if p['ok'] else 'MISSING'}  {p['detail']}")
+    print(format_record(jid, read_record(state, jid)))
     logs = [state / "log" / f"{jid}.log"] + [Path(os.path.expanduser(s[k])) for s in spec[jid]["steps"]
                                               for k in ("stdout", "stderr") if s[k] and s[k] != "/dev/null"]
     for p in dict.fromkeys(logs):
@@ -1720,13 +1726,15 @@ def web_scope(net):
     return "off" if net["status"] == "none" else "net"
 
 
-def tailscale_ip(run=subprocess.run, which=shutil.which, isfile=os.path.isfile):
-    """This machine's Tailscale IPv4 address, or None. Tries the CLI on PATH, then the app paths."""
+def tailscale_ip(run=subprocess.run, which=shutil.which, isfile=os.path.isfile, peer=None):
+    """This machine's Tailscale IPv4 address (or `peer`'s, by its machine name), or None. Tries the
+    CLI on PATH, then the app paths. Works without MagicDNS."""
     for c in [which("tailscale"), *TAILSCALE_BINS]:
         if not c or not isfile(c):
             continue
         try:
-            out = run([c, "ip", "-4"], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
+            out = run([c, "ip", "-4", *([peer] if peer else [])], capture_output=True, text=True, timeout=10,
+                      **NO_WINDOW).stdout
         except (OSError, subprocess.SubprocessError):
             continue
         for line in out.split():
@@ -1735,6 +1743,21 @@ def tailscale_ip(run=subprocess.run, which=shutil.which, isfile=os.path.isfile):
                     return line
             except ValueError:
                 pass
+    return None
+
+
+def tailscale_whois(ip, run=subprocess.run, which=shutil.which, isfile=os.path.isfile):
+    """The tailnet machine behind `ip`: the first label of Node.Name, lowercase (kmbp from
+    kmbp.example.ts.net.), or None when Tailscale does not know the address."""
+    for c in [which("tailscale"), *TAILSCALE_BINS]:
+        if not c or not isfile(c):
+            continue
+        try:
+            out = run([c, "whois", "--json", ip], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
+            name = json.loads(out)["Node"]["Name"]
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            continue
+        return str(name).split(".")[0].lower() or None
     return None
 
 
@@ -1768,12 +1791,61 @@ class WebApp:
     """What the page shows and does. Every outside effect goes through `run`, `remote` and
     `local_rows`, so the check can swap them."""
 
-    def __init__(self, net, spec, state, writes, run=None, remote=None, local_rows=None, ttl=8):
+    def __init__(self, net, spec, state, writes, run=None, local_rows=None, ttl=8, whois=None, now=None):
         self.net, self.spec, self.state, self.writes, self.ttl = net, spec, Path(state), writes, ttl
         self.run_ = run or self._run
-        self.remote = remote or (lambda h, c: remote_rows(h, c, timeout=20, opts=SSH_OPTS))
         self.local_rows = local_rows or self._local_rows
+        self.whois = whois or tailscale_whois
+        self.now = now or (lambda: datetime.now(timezone.utc))
         self.lock, self.cache, self.quiet = threading.Lock(), (0.0, None), False
+        self.reports = self._load_reports()
+
+    def _load_reports(self):
+        """The last report of each peer, kept in <state>/reports/<device>.json across restarts."""
+        out = {}
+        for f in (self.state / "reports").glob("*.json") if (self.state / "reports").is_dir() else []:
+            try:
+                out[f.stem] = json.loads(f.read_text())
+            except (OSError, ValueError):
+                pass
+        return out
+
+    def receive(self, ip, body):
+        """A peer's report: accepted only when Tailscale says the caller IS that device, and the
+        device is a member of this takt-net. Nothing in a report runs anything."""
+        try:
+            host, rows = str(body["host"]).lower(), body["rows"]
+            if not isinstance(rows, list) or len(rows) > 500 or not all(isinstance(r, dict) for r in rows):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            return 400, "bad report"
+        if host == self.net["self"] or host not in self.net["hosts"]:
+            return 403, f"{host} is not a device of this takt-net"
+        who = self.whois(ip)
+        if who != host:
+            return 403, f"the tailnet says {ip} is {who or 'unknown'}, not {host}"
+        keep = ("id", "sched", "schedule", "status", "last", "next", "detail", "record")
+        rep_ = {"host": host, "received": self.now().isoformat(timespec="seconds"),
+                "rows": [{k: r.get(k) for k in keep} for r in rows]}
+        d = self.state / "reports"
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f".{host}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(rep_))
+        os.replace(tmp, d / f"{host}.json")
+        with self.lock:
+            self.reports[host] = rep_
+            self.cache = (0.0, None)
+        return 200, "ok"
+
+    def age(self, host):
+        rep_ = self.reports.get(host)
+        if not rep_:
+            return "no report yet"
+        try:
+            s = int((self.now() - datetime.fromisoformat(rep_["received"])).total_seconds())
+        except (KeyError, ValueError, TypeError):
+            return "report time unknown"
+        return "reported " + (f"{s}s" if s < 120 else f"{s // 60} min" if s < 7200 else f"{s // 3600} h") + " ago"
 
     def _local_rows(self):
         spec = load_spec(self.spec) if Path(self.spec).exists() else {}
@@ -1808,12 +1880,16 @@ class WebApp:
             rows = [{"id": "-", "sched": "-", "status": "error", "last": None, "next": None, "detail": str(e)}]
         for r in rows:
             r["host"] = me
-        peers = [(h, c) for h, c in self.net["hosts"].items() if h != me]
-        with ThreadPoolExecutor() as ex:
-            rows += [x for rs in ex.map(lambda hc: self.remote(*hc), peers) for x in rs]
-        for r in rows:
-            r.pop("record", None)
-        return {"rows": rows, "note": None}
+        peers = [h for h in self.net["hosts"] if h != me]
+        for h in peers:  # from the peer's last report: this server never logs in to a peer
+            rep_ = self.reports.get(h)
+            if rep_:
+                rows += [{**r, "host": h} for r in rep_["rows"]]
+            else:
+                rows.append({"host": h, "id": "-", "sched": "-", "status": "no report", "last": None, "next": None,
+                             "detail": f"{h} reports after each job run, or with `takt report`"})
+        rows = [{k: v for k, v in r.items() if k != "record"} for r in rows]
+        return {"rows": rows, "note": None, "reports": " · ".join(f"{h} {self.age(h)}" for h in peers)}
 
     def argv(self, host, args):
         """The command for `host`: this script for the local device, ssh for a peer. None if unknown."""
@@ -1834,7 +1910,16 @@ class WebApp:
         return (200 if code == 0 else 502), text
 
     def show(self, host, jid):
-        return self.job_call(host, jid, ["show", jid])
+        if host == self.net["self"] or host not in self.net["hosts"]:
+            return self.job_call(host, jid, ["show", jid])
+        if not ID_RE.fullmatch(jid or ""):
+            return 400, "bad job id"
+        rep_ = self.reports.get(host) or {}
+        row = next((r for r in rep_.get("rows", []) if r.get("id") == jid), None)
+        if row is None:
+            return 404, f"no report from {host} for {jid}"
+        text = format_record(jid, row.get("record")) if isinstance(row.get("record"), dict) else f"{jid}: never run"
+        return 200, f"{text}\n\n({host} {self.age(host)}; the log tails stay on {host})"
 
     def act(self, host, jid, verb):
         if not self.writes:
@@ -1892,6 +1977,16 @@ def web_handler(app):
             origin = self.headers.get("Origin")
             if self.headers.get("X-Takt") != "1" or (origin and urlsplit(origin).netloc != self.headers.get("Host")):
                 return self.send(403, "missing X-Takt header or foreign Origin")
+            if urlsplit(self.path).path == "/api/report":
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n > 2_000_000:
+                        return self.send(413, "report too large")
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                except (ValueError, TypeError):
+                    return self.send(400, "bad report")
+                code, text = app.receive(self.client_address[0], body)
+                return self.send(code, text)
             if urlsplit(self.path).path != "/api/act":
                 return self.send(404, "not found")
             try:
@@ -1903,6 +1998,49 @@ def web_handler(app):
             code, text = app.act(host, jid, verb)
             self.send(code, text)
     return H
+
+
+def web_target(net, host, finder=tailscale_ip):
+    """Where to reach the web host `host`: settings.web_bind, else its Tailscale address (no MagicDNS
+    needed), else the name itself."""
+    addr = net.get("web_bind", {}).get(host) or finder(peer=host) or host
+    return f"http://{'[' + addr + ']' if ':' in addr else addr}:{net.get('web_port', WEB_PORT)}/api/report"
+
+
+def send_reports(net, rows, post=None, finder=tailscale_ip):
+    """POST this device's rows to every web host but itself. Best effort, 5 s per host: a web host
+    that is down never fails a job. -> {web host: "ok" or the error}."""
+    def post_(url, body):
+        req = urllib.request.Request(url, data=body, headers={"X-Takt": "1", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status
+    post = post or post_
+    body = json.dumps({"host": net["self"], "rows": rows}).encode()
+    out = {}
+    for h in net.get("web", []):
+        if h == net["self"]:
+            continue
+        try:
+            out[h] = "ok" if post(web_target(net, h, finder), body) == 200 else "refused"
+        except Exception as e:  # noqa: BLE001  any failure is a line in the log, never a failed job
+            out[h] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def should_report(spec_path, env=os.environ):
+    """Only a run of this device's own jobs file reports, so a test or a second --spec never shows
+    up on the dashboard. TAKT_NO_REPORT=1 turns it off (the self-test sets it)."""
+    return not env.get("TAKT_NO_REPORT") and Path(spec_path).resolve() == (CONFIG / "jobs.toml").resolve()
+
+
+def report_now(spec_path, state):
+    """Send this device's rows (its own jobs file) to the web hosts. Quiet when there are none."""
+    net = net_settings()
+    if not [h for h in net.get("web", []) if h != net["self"]]:
+        return {}
+    spec = load_spec(spec_path) if Path(spec_path).exists() else {}
+    be = backend()
+    return send_reports(net, status_rows(spec, Path(state), native_states(spec, be, default_dir(be, Path(state)))))
 
 
 def web_main(a):
@@ -2039,7 +2177,7 @@ function render(){const f=$('#q').value.toLowerCase(),tb=$('#rows');tb.textConte
   const tr=document.createElement('tr');if(sel&&sel.host===r.host&&sel.id===r.id)tr.className='sel';
   tr.append(td(r.host),td(r.id),td(r.sched),td(r.status,r.status),td(hm(r.last)),td(hm(r.next)),td(r.detail||'','d'));
   if(r.id!=='-')tr.onclick=()=>{sel={host:r.host,id:r.id};render();detail()};tb.append(tr)}
- $('#meta').textContent=(data.note||('on '+data.self+' · '+(data.writes?'writes on':'read-only')+' · '+(data.generated||'')))}
+ $('#meta').textContent=(data.note||('on '+data.self+' · '+(data.writes?'writes on':'read-only')+' · '+(data.generated||'')+(data.reports?' · '+data.reports:'')))}
 async function load(){try{const r=await fetch('/api/status');data=await r.json();$('#banner').textContent='';render();if(sel)detail()}
  catch(e){$('#banner').textContent='cannot reach takt: '+e}}
 async function detail(){if(!sel)return;$('#title').textContent=sel.host+' / '+sel.id;const p=$('#show');p.hidden=false;
@@ -2135,6 +2273,7 @@ def build_parser():
             ins.add_argument("ids", nargs="*", help="default: every job in the spec")
         ins.add_argument("--allow-writes", action="store_true")
         ins.add_argument("--agents-dir", help="LaunchAgents / systemd user unit dir (default per OS)")
+    common(sub.add_parser("report", help="send this device's job rows to the web hosts now"))
     sub.add_parser("push", help="with --host H: copy takt.py and jobs.H.toml to H").add_argument(
         "--allow-writes", action="store_true")
     common(sub.add_parser("init", help="write a starter jobs.toml (never overwrites)"))
@@ -2164,6 +2303,13 @@ def main(argv=None):
         sys.exit("push needs a host: takt --host <host> push --allow-writes")
     if a.cmd == "init":
         return init_spec(Path(a.spec))
+    if a.cmd == "report":
+        res = report_now(a.spec, state_dir(a))
+        for h, r in res.items():
+            print(f"{h}: {r}")
+        if not res:
+            print("no web hosts in settings.web")
+        return 0 if all(r == "ok" for r in res.values()) else 1
     if a.cmd == "web":
         return web_main(a)
     if a.cmd == "run":
@@ -2183,7 +2329,17 @@ def main(argv=None):
         scheduled, trig = a.scheduled, None
         if scheduled and not a.dry_run and take_start(state_dir(a), a.id):
             scheduled, trig = False, "start"  # asked for by `takt start`: run it, whatever the slot
-        return run_job(spec, a.id, state_dir(a), now, scheduled, a.dry_run, trigger=trig)
+        code = run_job(spec, a.id, state_dir(a), now, scheduled, a.dry_run, trigger=trig)
+        # report this device to the web hosts: only for its own jobs file, so a test or a second
+        # --spec never shows up on the dashboard. Never fails the job.
+        if not a.dry_run and should_report(a.spec):
+            try:
+                for h, res in report_now(a.spec, state_dir(a)).items():
+                    if res != "ok":
+                        print(f"report to {h}: {res}", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"report: {e}", file=sys.stderr)
+        return code
     be = backend()
     adir = Path(getattr(a, "agents_dir", None) or default_dir(be, state_dir(a)))
     if a.cmd == "status":
@@ -2297,6 +2453,7 @@ def self_check():
     # wrappers keep containment (their own module), and check_windows_last tests it directly.
     global CONTAIN
     CONTAIN = False
+    os.environ["TAKT_NO_REPORT"] = "1"  # wrappers spawned by the checks never report to a real web host
     n = {"ok": 0, "bad": 0}
 
     def ok(cond, name):
@@ -2328,6 +2485,7 @@ def self_check():
         check_owned(ok, tmp)
         check_web(ok, tmp)
         check_plans_apply(ok, tmp)
+        check_web_reports(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -3642,14 +3800,18 @@ def check_web(ok, tmp):
     me = {"self": "kvps", "hosts": {"kmbp": {"python": "p"}, "kwin": {"python": "w"}}, "status": "master", "web": ["kvps"],
           "web_port": 0, "web_writes": False, "web_bind": {}}
 
-    def remote(h, c):
-        if h == "kwin":
-            return [{"host": h, "id": "-", "sched": "-", "status": "unreachable", "last": None, "next": None, "detail": "ssh down"}]
-        return [{"host": h, "id": "j", "sched": "on", "status": "ok", "last": None, "next": None, "detail": "", "record": {"x": 1}}]
+    seeded = {"kmbp": {"host": "kmbp", "received": "2026-10-04T20:00:00+00:00", "rows": [
+        {"id": "j", "sched": "on", "status": "ok", "last": None, "next": None, "detail": "",
+         "record": {"status": "ok", "started": "2026-10-04T19:59:00", "duration_s": 1, "slot": "x", "trigger": "scheduled",
+                    "steps": [{"id": "main", "status": "ok", "exit": 0, "duration_s": 1, "failed": []}], "preflight": []}}]}}
+    fixed_now = lambda: datetime(2026, 10, 4, 20, 5, tzinfo=timezone.utc)
 
-    def serve(writes):
-        app = WebApp(me, tmp / "nospec.toml", tmp / "web-st", writes, run=lambda a: (calls.append(a), (0, "ran"))[1], remote=remote,
-                     local_rows=lambda: [{"id": "mine", "sched": "on", "status": "ok", "last": None, "next": None, "detail": ""}])
+    def serve(writes, whois=lambda ip: None, state=None):
+        app = WebApp(me, tmp / "nospec.toml", state or tmp / "web-st", writes, run=lambda a: (calls.append(a), (0, "ran"))[1],
+                     local_rows=lambda: [{"id": "mine", "sched": "on", "status": "ok", "last": None, "next": None, "detail": ""}],
+                     whois=whois, now=fixed_now)
+        if state is None:
+            app.reports = dict(seeded)
         app.quiet = True
         srv = ThreadingHTTPServer(("127.0.0.1", 0), web_handler(app))
         srv.daemon_threads = True
@@ -3670,13 +3832,15 @@ def check_web(ok, tmp):
         code, body = http(base + "/api/status")
         d = json.loads(body)
         by = {(r["host"], r["id"]): r for r in d["rows"]}
-        ok(code == 200 and set(by) == {("kvps", "mine"), ("kmbp", "j"), ("kwin", "-")} and by[("kwin", "-")]["status"] == "unreachable"
-           and d["writes"] is False and "record" not in by[("kmbp", "j")],
-           "web: /api/status has this device's rows and every peer's, and an unreachable peer is a row")
+        ok(code == 200 and set(by) == {("kvps", "mine"), ("kmbp", "j"), ("kwin", "-")} and by[("kwin", "-")]["status"] == "no report"
+           and d["writes"] is False and "record" not in by[("kmbp", "j")]
+           and "kmbp reported 5 min ago" in d["reports"] and "kwin no report yet" in d["reports"],
+           "web: /api/status has this device's rows and each peer's last report, with its age; a silent peer is a row")
         ok("takt" in http(base + "/")[1] and http(base + "/")[0] == 200, "web: / serves the page")
+        n = len(calls)
         code, body = http(base + "/api/show?host=kmbp&id=j")
-        ok(code == 200 and body == "ran" and calls[-1][0] == "ssh" and "BatchMode=yes" in calls[-1] and calls[-1][-1].endswith("show j"),
-           "web: show of a peer runs takt over ssh without a password prompt")
+        ok(code == 200 and body.startswith("j  ok") and "step main" in body and "log tails stay on kmbp" in body and len(calls) == n,
+           "web: show of a peer comes from its report; the server runs nothing and logs in nowhere")
         http(base + "/api/show?host=kvps&id=mine")
         ok(calls[-1][1:3] == [str(Path(__file__).resolve()), "show"] or calls[-1][2] == "show", "web: show of this device runs locally")
         n = len(calls)
@@ -3703,10 +3867,61 @@ def check_web(ok, tmp):
     finally:
         srv.shutdown()
         srv.server_close()
-    app = WebApp({**me, "status": "none"}, tmp / "x", tmp / "y", False, remote=remote, local_rows=lambda: [{"id": "a"}])
+    app = WebApp({**me, "status": "none"}, tmp / "x", tmp / "y", False, local_rows=lambda: [{"id": "a"}])
     ok(app.rows()["rows"] == [], "web: settings.status = none shows no rows")
     ok(build_parser().parse_args(["web", "--bind", "127.0.0.1", "--port", "1"]).port == 1
        and "web" in starter_spec() and 'web = ["myvps"]' in starter_spec(), "web: the CLI has `web`, and takt init mentions it")
+
+
+def check_web_reports(ok, tmp):
+    """Peers push their rows to the web host; the tailnet says who is calling."""
+    import urllib.error
+    net = {"self": "kvps", "hosts": {"kmbp": {}, "kwin": {}}, "status": "master", "web": ["kvps"], "web_port": 0,
+           "web_writes": False, "web_bind": {}}
+    st = tmp / "reports-st"
+    app = WebApp(net, tmp / "nospec.toml", st, False, local_rows=lambda: [],
+                 whois=lambda ip: {"100.1.1.2": "kwin", "100.1.1.3": "evil", "100.1.1.4": "kvps"}.get(ip),
+                 now=lambda: datetime(2026, 10, 4, 21, 0, tzinfo=timezone.utc))
+    row = {"id": "disk-watch", "sched": "on", "status": "partial", "last": "2026-10-04T23:00:42", "next": None,
+           "detail": "D: 9.4% free", "record": {"status": "partial", "steps": [], "preflight": []}, "junk": "x" * 10}
+    ok(app.receive("100.1.1.2", {"host": "kwin", "rows": [row]}) == (200, "ok") and (st / "reports/kwin.json").exists(),
+       "report: the tailnet's kwin may report as kwin, and the report is kept on disk")
+    got = {r["id"]: r for r in app.rows()["rows"] if r["host"] == "kwin"}
+    ok(got["disk-watch"]["status"] == "partial" and "junk" not in got["disk-watch"] and "record" not in got["disk-watch"],
+       "report: the page shows the reported rows, only the known fields")
+    ok(app.receive("100.1.1.2", {"host": "kmbp", "rows": []})[0] == 403, "report: a device cannot report as another")
+    ok(app.receive("100.9.9.9", {"host": "kwin", "rows": []})[0] == 403, "report: an address the tailnet does not know is refused")
+    ok(app.receive("100.1.1.4", {"host": "kvps", "rows": []})[0] == 403 and app.receive("100.1.1.3", {"host": "evil", "rows": []})[0] == 403,
+       "report: a tailnet device that is not in the takt-net, or the web host itself, cannot report")
+    ok(app.receive("100.1.1.2", {"host": "kwin", "rows": "x"})[0] == 400 and app.receive("100.1.1.2", {})[0] == 400,
+       "report: a malformed report is refused")
+    again = WebApp(net, tmp / "nospec.toml", st, False, local_rows=lambda: [], whois=lambda ip: None)
+    ok(again.reports.get("kwin", {}).get("rows", [{}])[0].get("id") == "disk-watch", "report: reports survive a restart")
+    ok(again.show("kwin", "disk-watch")[0] == 200 and again.show("kwin", "nope")[0] == 404, "report: show reads the reported record")
+
+    sent = []
+
+    def post(url, body):
+        sent.append((url, json.loads(body)))
+        return 200
+    res = send_reports({"self": "kwin", "web": ["kvps", "kwin"], "web_port": 8787, "web_bind": {}}, [{"id": "a"}],
+                       post=post, finder=lambda peer=None: {"kvps": "100.68.171.58"}.get(peer))
+    ok(res == {"kvps": "ok"} and sent == [("http://100.68.171.58:8787/api/report", {"host": "kwin", "rows": [{"id": "a"}]})],
+       "report: a device sends its rows to every web host but itself, at its Tailscale address")
+
+    def down(url, body):
+        raise urllib.error.URLError("connection refused")
+    res = send_reports({"self": "kwin", "web": ["kvps"], "web_port": 8787, "web_bind": {"kvps": "10.0.0.5"}}, [], post=down)
+    ok(res["kvps"].startswith("URLError") , "report: a web host that is down is an error string, never an exception")
+    g = globals()
+    saved = g["CONFIG"]
+    try:
+        g["CONFIG"] = tmp / "report-config"
+        own = g["CONFIG"] / "jobs.toml"
+        ok(should_report(own, {}) and not should_report(tmp / "other.toml", {}) and not should_report(own, {"TAKT_NO_REPORT": "1"}),
+           "report: only a run of this device's own jobs file reports, and TAKT_NO_REPORT turns it off")
+    finally:
+        g["CONFIG"] = saved
 
 
 def check_plans_apply(ok, tmp):

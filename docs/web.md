@@ -63,20 +63,26 @@ A web device is a viewer. It shows every device in the takt-net, also when `sett
 
 `settings.status` still controls `takt status -A` and the TUI on that device. A web device in `master` mode shows all devices on its page and a pointer to the master on the command line.
 
-Each row has a host, a job, `SCHED`, `STATUS`, the last run, the next run and a detail. A device that does not answer shows as one row with the status `unreachable` and the error. The rest of the page works.
+Each row has a host, a job, `SCHED`, `STATUS`, the last run, the next run and a detail. The rows of this device are read when the page asks. The rows of the other devices come from their last report. The header shows the age of each report, for example `kmbp reported 3 min ago · kwin no report yet`.
 
-## Ssh from the web device
+## Reports from the other devices
 
-The web device pulls the rows of the other devices over ssh, in the same way as `takt status -A`. It uses the names in `net.toml`. Each name must work as `ssh <name>` from the web device, without a password prompt:
+The web device does not log in to other devices. Each device sends its own rows to the web devices:
 
-1. Put the ssh public key of the web device in `authorized_keys` on each other device.
-2. Add a `Host <name>` entry with `HostName` and `User` to the ssh config of the web device, if the name does not resolve to the right user and address.
-3. Connect once from the web device (`ssh <name> true`), so that it knows the host key.
-4. Make sure that the other device has `takt.py` and Python 3.11 or later. `takt --host <name> push --allow-writes` does that.
+- After each run of a job from its own jobs file (`~/.config/takt/jobs.toml`), the wrapper sends `POST /api/report` to each web device in `settings.web`. A test run or a run from another `--spec` file does not report.
+- `takt report` sends the rows now.
+- A send waits 5 seconds at most. If the web device does not answer, the job is not affected, and the error goes to the log of the job. The next run sends the full rows again.
+- The device finds the web device with `tailscale ip -4 <name>`, so MagicDNS is not necessary. `[settings.web_bind]` overrides the address.
 
-The server runs ssh with `BatchMode=yes` and `ConnectTimeout=8`. It never asks for a password and never waits for a prompt. The controller is a member of the net with the path of its `takt.py`. If you do not run an ssh server on the controller, it shows as unreachable on the other web devices.
+The web device accepts a report only if Tailscale confirms the sender. It runs `tailscale whois` on the address of the caller. The first part of the machine name (`kmbp` in `kmbp.example.ts.net`) must be the device that the report names, and that device must be a member of the takt-net. If Tailscale does not know the address, or if the `tailscale` command is missing, the report is refused. A report holds rows only. It cannot run anything.
 
-takt does not create keys or change the ssh config.
+The web device keeps the last report of each device in `<state>/reports/<device>.json`, so a restart keeps them. When a device is asleep or offline, the page shows its last report and the age of that report.
+
+Use the Tailscale machine names of your devices as their names in takt (`jobs.<name>.toml`), so that the names in `tailscale whois` and in takt agree.
+
+The detail pane of a job on another device shows the reported record: status, steps, notes and preflight. The log tails stay on that device. Use `takt --host <name> show <id>` from the controller to see them.
+
+The start, enable and disable buttons for another device still use ssh from the web device (see "Write buttons"). The page itself does not need ssh.
 
 ## Write buttons
 

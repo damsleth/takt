@@ -72,7 +72,7 @@ kwin   probe         on     ok      10-02 22:10  10-02 22:15
 
 - [Commands](docs/cli.md): every command, the TUI keys, environment variables.
 - [Jobs file](docs/jobs.md): all keys, schedules, preflight checks, status values.
-- [Web dashboard](docs/web.md): `takt web`, which devices serve it, ssh setup.
+- [Web dashboard](docs/web.md): `takt web`, which devices serve it, and how the other devices report to it.
 - [Hosts](docs/hosts.md): other hosts over ssh, Linux and Windows setup.
 - [Design](docs/design.md): how locks, ordering, catch-up and status work, and the measurements.
 - [Security](SECURITY.md): what takt trusts, and how to report a problem.
