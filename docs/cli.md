@@ -84,10 +84,13 @@ See [hosts.md](hosts.md).
 
 Both commands only read. Copy the output into your jobs file and edit it.
 
+`import-plist` takes the command from `ProgramArguments`. When the plist also has `Program`, that is the executable, and the first entry of `ProgramArguments` (which is only `argv[0]`) is dropped.
+
 `import-cron` splits a line into steps only when the line is plain arguments, `;`, `>>` and `2>>`. These lines become one `/bin/sh -c` step with the text unchanged:
 
 - shell expansion: `$`, backticks, `*`, `?`, `[`, `{`, `~`, and any backslash escape (`echo \;`)
 - an environment prefix (`NAME=value cmd`), or a `2` before `>>` that is quoted or spaced (`echo "2">> f`, `echo 2 >> f`): the `2` is an argument
+- any other descriptor before `>>` (`echo hi 1>> f`)
 - a `#` inside the command (`echo abc#def`), and a shell builtin such as `cd`, `export` or `source` (`cd /tmp; ./run`), because the next command depends on it
 - a quote next to an operator (`echo ";"`), because the quotes make the operator an argument
 - a truncating `>`, pipes and other operators
