@@ -10,7 +10,8 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 |---|---|
 | `takt` | Opens the TUI. The same as `takt ui`. |
 | `takt status` | Shows the scheduler state, the last run and the next slot of every job. |
-| `takt status -A` | The same for this machine and every host in `~/.config/takt/`. Hosts run in parallel. |
+| `takt status -A` | The same for every device in the takt-net, if `settings.status` lets this device show them. Hosts run in parallel. |
+| `takt status --here` | This device's jobs, whatever `settings.status` says. |
 | `takt status --json` | The same rows as JSON, for other tools. |
 | `takt show <id>` | Shows the last record of a job: steps, exit codes, step notes, preflight, and the end of its logs. |
 | `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. If the job is already running, also while it waits for a lock, takt says so and starts nothing. Needs `--allow-writes`. |
@@ -18,6 +19,19 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 | `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
 
 `SCHED` in the status table is `on` (installed and armed), `off` (installed, disarmed) or `-` (not installed). `NEXT` uses the clock of the host.
+
+## Status across devices
+
+The takt-net is the controller (the device with the `jobs.<host>.toml` files) and its hosts. `[settings] status` in the controller's `jobs.toml` sets where job statuses show. `push` and `install` copy it to each host in `~/.config/takt/net.toml`, with the list of the other devices.
+
+| `status` | `takt status -A` and the TUI show |
+|---|---|
+| `master` (default) | On the master (`[settings] master`, default the controller): every device. On other devices: a pointer to the master. |
+| `all` | On every device: every device. Each device must reach the others with `ssh <name>`. |
+| `client` | On every device: only its own jobs. |
+| `none` | Nothing. |
+
+`takt status --here` shows the jobs of this device in every mode. `takt show <id>` is not affected, so the TUI on the master can preview any device. Run `takt --host <h> push --allow-writes` after you change the mode, so each host gets it.
 
 ## Setup
 

@@ -19,7 +19,7 @@ takt status -A
 
 `takt --host <host> <command>` does this:
 
-1. For `push` and `install`: one `scp -r` copies `takt.py` to `~/.local/share/takt/takt.py` and `jobs.<host>.toml` to `~/.config/takt/jobs.toml` on the host.
+1. For `push` and `install`: one `scp -r` copies `takt.py` to `~/.local/share/takt/takt.py`, `jobs.<host>.toml` to `~/.config/takt/jobs.toml`, and the takt-net settings to `~/.config/takt/net.toml` on the host (see [Status across devices](cli.md#status-across-devices)).
 2. It runs `ssh <host> '<python> .local/share/takt/takt.py <command>'`.
 3. It prints the output of the host and returns its exit code.
 

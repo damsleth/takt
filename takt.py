@@ -29,6 +29,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1448,7 +1449,7 @@ def remote_argv(host, args, cfg=None):
     if not HOST_RE.fullmatch(host):
         raise ValueError(f"not an ssh alias: {host!r}")
     cfg = host_settings(host) if cfg is None else cfg
-    cmd = [cfg.get("python", "python3"), f"{REMOTE_DIR}/takt.py", *args]
+    cmd = [cfg.get("python", "python3"), cfg.get("script", f"{REMOTE_DIR}/takt.py"), *args]
     bad = [x for x in cmd if not SAFE_ARG.fullmatch(x)]
     if bad:
         raise ValueError(f"not forwardable over ssh: {bad}")
@@ -1464,6 +1465,7 @@ def push(host):
         (Path(t) / ".config/takt").mkdir(parents=True)
         shutil.copy(Path(__file__).resolve(), Path(t) / REMOTE_DIR / "takt.py")
         shutil.copy(CONFIG / f"jobs.{host}.toml", Path(t) / ".config/takt/jobs.toml")
+        (Path(t) / ".config/takt/net.toml").write_text(net_toml(host, net_settings()))
         return subprocess.run(["scp", "-q", "-r", str(Path(t) / ".local"), str(Path(t) / ".config"),
                                f"{host}:"]).returncode
 
@@ -1490,17 +1492,84 @@ def on_host(host, rest):
     return subprocess.run(cmdline).returncode
 
 
-def remote_rows(host):
+STATUS_MODES = ("master", "all", "client", "none")
+STATUS_PULL = ["status", "--json", "--here"]  # a peer answers with its own rows, whatever its mode
+
+
+def self_name():
+    return socket.gethostname().split(".")[0].lower()
+
+
+def net_settings():
+    """This device's view of the takt-net: {status, master, self, hosts: {name: {python, script?}}}.
+    A host reads net.toml, which `push` writes. The controller (the device with the jobs.<host>.toml
+    files) reads `[settings] status / master / name` from its jobs.toml. A device with neither is a
+    net of one and its own master."""
+    f = CONFIG / "net.toml"
+    if f.exists():
+        net = tomllib.loads(f.read_text())
+    else:
+        jt = CONFIG / "jobs.toml"
+        cfg = tomllib.loads(jt.read_text()).get("settings", {}) if jt.exists() else {}
+        me = cfg.get("name") or self_name()
+        net = {"status": cfg.get("status", "master"), "master": cfg.get("master", me), "self": me,
+               "hosts": {h: {"python": host_settings(h).get("python", "python3")} for h in hosts()[1:]},
+               "python": cfg.get("python") or (sys.executable if os.name == "nt" else shutil.which("python3") or sys.executable)}
+    net.setdefault("self", self_name())
+    net.setdefault("status", "master")
+    net.setdefault("master", net["self"])
+    net.setdefault("hosts", {})
+    if net["status"] not in STATUS_MODES:
+        raise ValueError(f"settings.status {net['status']!r}: use one of {', '.join(STATUS_MODES)}")
+    if net["master"] == "local":
+        net["master"] = net["self"]
+    return net
+
+
+def status_scope(net, all_hosts, here=False):
+    """Which statuses this device shows -> ("off" | "local" | "net", note or None).
+    master: only the master shows statuses, and its -A shows every member. all: every device's -A
+    shows every member. client: each device shows only its own jobs. none: no statuses."""
+    if here:
+        return "local", None
+    mode, is_master = net["status"], net["master"] == net["self"]
+    if mode == "none":
+        return "off", "status display is off (settings.status = none)"
+    if mode == "master" and not is_master:
+        return "off", (f"statuses show on {net['master']} (settings.status = master); "
+                       "`takt status --here` shows this device")
+    if mode == "client":
+        return "local", ("each device shows only its own jobs (settings.status = client)" if all_hosts else None)
+    return ("net" if all_hosts else "local"), None
+
+
+def net_toml(host, net):
+    """net.toml for `host`: the mode, the master, its own name, and every other member with the
+    python (and script path) to reach it, so `all` can fan out from that host too."""
+    members = {h: c for h, c in net["hosts"].items() if h != host}
+    members[net["self"]] = {"python": net.get("python") or "python3", "script": str(Path(__file__).resolve())}
+    out = [f"# written by `takt --host {host} push` from {net['self']}; edit the controller's jobs.toml instead",
+           f"status = {toml_val(net['status'])}", f"master = {toml_val(net['master'])}", f"self = {toml_val(host)}", ""]
+    for name, c in sorted(members.items()):
+        out.append(f"[hosts.{toml_val(name)}]")
+        out += [f"{k} = {toml_val(v)}" for k, v in sorted(c.items())] + [""]
+    return "\n".join(out)
+
+
+def remote_rows(host, cfg=None):
     down = lambda why: [{"host": host, "id": "-", "sched": "-", "status": "unreachable", "last": None,
                          "next": None, "detail": why}]
     try:
-        r = subprocess.run(remote_argv(host, ["status", "--json"]), capture_output=True, text=True, timeout=60)
+        r = subprocess.run(remote_argv(host, STATUS_PULL, cfg), capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError) as e:
         return down(str(e))
     try:
         rows = json.loads(r.stdout)
     except ValueError:
-        return down((r.stderr.strip().splitlines() or [f"no takt there? takt --host {host} push --allow-writes"])[-1])
+        err = (r.stderr.strip().splitlines() or [f"no takt there? takt --host {host} push --allow-writes"])[-1]
+        if "unrecognized arguments" in err or "invalid choice" in err:  # the host runs an older takt.py
+            err = f"{host} runs an older takt; update it: takt --host {host} push --allow-writes"
+        return down(err)
     for x in rows:
         x["host"] = host
     return rows
@@ -1510,6 +1579,10 @@ def ui(allow_writes):
     """fzf over every host's status: preview = `show`, keys run the admin verbs on that host."""
     if not shutil.which("fzf"):
         sys.exit("takt ui needs fzf")
+    scope, note = status_scope(net_settings(), True)
+    if scope == "off":
+        print(note)
+        return 0
     me = shlex.quote(str(Path(__file__).resolve()))
     ls = f"{me} status -A"
     binds = [f"start:reload({ls})", f"ctrl-r:reload({ls})",
@@ -1583,7 +1656,8 @@ def build_parser():
     r.add_argument("--now", help="ISO local time, for tests")
     st = common(sub.add_parser("status", help="scheduler state and last run of every job"))
     st.add_argument("--json", action="store_true")
-    st.add_argument("-A", "--all-hosts", action="store_true", help="this machine and every jobs.<host>.toml host")
+    st.add_argument("-A", "--all-hosts", action="store_true", help="every device in the takt-net, if settings.status allows")
+    st.add_argument("--here", action="store_true", help="this device's jobs, whatever settings.status says")
     sh = common(sub.add_parser("show", help="last record and log tails of one job"))
     sh.add_argument("id")
     for verb in ("start", "enable", "disable"):
@@ -1652,15 +1726,25 @@ def main(argv=None):
     be = backend()
     adir = Path(getattr(a, "agents_dir", None) or default_dir(be, state_dir(a)))
     if a.cmd == "status":
+        net = net_settings()
+        scope, note = status_scope(net, a.all_hosts, a.here)
+        if scope == "off":
+            print("[]" if a.json else note)
+            if a.json:
+                print(note, file=sys.stderr)
+            return 0
         spec = load_spec(a.spec) if Path(a.spec).exists() else {}  # a controller may only have hosts
         rows = status_rows(spec, state_dir(a), native_states(spec, be, adir))
-        if a.all_hosts:
+        if scope == "net":
+            peers = [(h, c) for h, c in net["hosts"].items() if h != net["self"]]
             with ThreadPoolExecutor() as ex:
-                rows += [x for rs in ex.map(remote_rows, hosts()[1:]) for x in rs]
+                rows += [x for rs in ex.map(lambda hc: remote_rows(*hc), peers) for x in rs]
         if a.json:
             print(json.dumps(rows, indent=1))
         else:
             print("\n".join(fmt_rows(rows)))
+        if note:
+            print(note, file=sys.stderr)
         return 0
     if a.cmd == "show":
         return show(load_spec(a.spec), state_dir(a), a.id)
@@ -1775,6 +1859,7 @@ def self_check():
         check_review9(ok, tmp)
         check_review10(ok, tmp)
         check_owa_reseed(ok, tmp)
+        check_status_scope(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2809,6 +2894,64 @@ def check_owa_reseed(ok, tmp):
         finally:
             os.environ.pop("TAKT_OWA_PIGGY")
         ok(st and set(st["json"]) == {"good", "tired", "gone", "dead", "google"}, "owa: status --json is read from owa-piggy")
+
+
+def check_status_scope(ok, tmp):
+    """settings.status: master (default), all, client, none."""
+    import contextlib
+    import io
+    master, other = {"status": "master", "master": "kmbp", "self": "kmbp"}, {"status": "master", "master": "kmbp", "self": "kvps"}
+    table = {
+        ("master", "kmbp", True): "net", ("master", "kmbp", False): "local", ("master", "kvps", True): "off",
+        ("all", "kvps", True): "net", ("all", "kvps", False): "local",
+        ("client", "kmbp", True): "local", ("client", "kvps", True): "local",
+        ("none", "kmbp", True): "off", ("none", "kvps", False): "off"}
+    got = {(m, me, a): status_scope({"status": m, "master": "kmbp", "self": me}, a)[0] for (m, me, a) in table}
+    ok(got == table, f"status: the scope table for master/all/client/none ({ {k: v for k, v in got.items() if table[k] != v} })")
+    ok(status_scope(other, True, here=True)[0] == "local" and "kmbp" in status_scope(other, True)[1],
+       "status: a non-master points to the master, and --here shows this device anyway")
+    ok(status_scope(master, False) == ("local", None), "status: the master's plain status is its own jobs")
+    ok(build_parser().parse_args(STATUS_PULL).here, "status: a peer is pulled with --here, so its mode cannot hide it")
+
+    g = globals()
+    saved = g["CONFIG"]
+    try:
+        cdir = tmp / "net-controller"
+        cdir.mkdir()
+        g["CONFIG"] = cdir
+        ok(net_settings()["status"] == "master" and net_settings()["master"] == net_settings()["self"],
+           "net: with no settings a device is its own master")
+        (cdir / "jobs.toml").write_text('[settings]\nstatus = "all"\nname = "kmbp"\npython = "/opt/homebrew/bin/python3"\n')
+        (cdir / "jobs.kvps.toml").write_text('[settings]\npython = "/usr/bin/python3"\n')
+        (cdir / "jobs.kwin.toml").write_text("[settings]\npython = 'C:\\Py\\python.exe'\n")
+        net = net_settings()
+        ok(net["status"] == "all" and net["self"] == "kmbp" and set(net["hosts"]) == {"kvps", "kwin"},
+           "net: the controller reads status, its name and the hosts from its config")
+        text = net_toml("kvps", net)
+        hdir = tmp / "net-host"
+        hdir.mkdir()
+        (hdir / "net.toml").write_text(text)
+        g["CONFIG"] = hdir
+        hn = net_settings()
+        ok(hn["self"] == "kvps" and hn["status"] == "all" and hn["master"] == "kmbp" and set(hn["hosts"]) == {"kmbp", "kwin"}
+           and hn["hosts"]["kmbp"]["script"].endswith("takt.py") and hn["hosts"]["kwin"]["python"] == "C:\\Py\\python.exe",
+           "net: push gives a host the mode, the master and the other members (controller with its script path)")
+        ok(remote_argv("kmbp", STATUS_PULL, hn["hosts"]["kmbp"])[-1].split()[1] == hn["hosts"]["kmbp"]["script"],
+           "net: a host reaches the controller's takt.py by its own path")
+        (cdir / "jobs.toml").write_text('[settings]\nstatus = "none"\n')
+        g["CONFIG"] = cdir
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            main(["status", "-A"])
+        ok("status display is off" in out.getvalue(), "status: settings.status = none shows no statuses")
+        (cdir / "jobs.toml").write_text('[settings]\nstatus = "loud"\n')
+        try:
+            net_settings()
+            ok(False, "net: an unknown status mode is an error")
+        except ValueError:
+            ok(True, "")
+    finally:
+        g["CONFIG"] = saved
 
 
 def check_windows_last(ok):
