@@ -62,7 +62,7 @@ SKIP_AFTER = 300  # catch_up="skip": a scheduled start later than this past its 
 RANGES = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
 ALIASES = {"@hourly": "0 * * * *", "@daily": "0 0 * * *", "@weekly": "0 0 * * 0",
            "@monthly": "0 0 1 * *"}
-ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")  # no leading "-": an id is an argv word
 # Windows device names: `NUL.lock` is the null device, not a file. Rejected everywhere, so a jobs
 # file stays valid on every OS.
 RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
@@ -914,7 +914,7 @@ def schtasks_triggers(f):
     if hr is None:
         if mi is None:
             return [(0, 0, "PT1M")]
-        if len(mi) > 1 and mi[0] == 0 and mi == list(range(0, 60, mi[1])):
+        if len(mi) > 1 and mi[0] == 0 and 60 % mi[1] == 0 and mi == list(range(0, 60, mi[1])):  # */7 restarts at :00
             return [(0, 0, f"PT{mi[1]}M")]
         return [(0, m, "PT1H") for m in mi]
     if mi is None:
@@ -1295,7 +1295,8 @@ def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, 
     `web`: None leaves the web service alone; a command list installs it (install only); False
     retires it (install on a device that is not a web host, and uninstall without ids)."""
     owned = known if owned is None else owned
-    foreign = [i for i in spec if i in known and i not in owned]  # same id, installed from another jobs file
+    kl, ol = {k.lower() for k in known}, {o.lower() for o in owned}  # Foo and foo are one unit file on macOS and Windows
+    foreign = [i for i in spec if i.lower() in kl and i.lower() not in ol]  # same id, installed from another jobs file
     if cmd == "install":
         if foreign:
             raise ValueError(f"{', '.join(foreign)}: installed from another jobs file. Rename the job here, or "
@@ -1727,6 +1728,7 @@ WEB_PORT = 8787
 WEB_LABEL, WEB_UNIT, WEB_TASK = "dev.takt-web", "takt.web", "\\takt-web\\serve"
 TAILSCALE_BINS = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", r"C:\Program Files\Tailscale\tailscale.exe"]
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]  # no prompt can hang the page
+REPORT_KEYS = ("id", "sched", "schedule", "status", "last", "next", "detail", "record")
 WEB_VERBS = ("start", "enable", "disable")
 
 
@@ -1838,18 +1840,28 @@ class WebApp:
         out = {}
         for f in (self.state / "reports").glob("*.json") if (self.state / "reports").is_dir() else []:
             try:
-                out[f.stem] = json.loads(f.read_text())
-            except (OSError, ValueError):
+                rep_ = json.loads(f.read_text())
+                rep_["rows"] = self.clean_rows(rep_.get("rows"))
+                out[f.stem] = rep_
+            except (OSError, ValueError, TypeError, AttributeError):
                 pass
         return out
+
+    @staticmethod
+    def clean_rows(rows):
+        """A peer's rows, reduced to the known fields of plain types, so one bad report cannot break
+        the page for every viewer. ValueError when it is not a list of rows."""
+        if not isinstance(rows, list) or len(rows) > 500 or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("bad rows")
+        plain = lambda v: v if v is None or isinstance(v, (str, int, float)) else str(v)
+        return [{k: (r.get(k) if isinstance(r.get(k), dict) else None) if k == "record" else plain(r.get(k))
+                 for k in REPORT_KEYS} for r in rows]
 
     def receive(self, ip, body):
         """A peer's report: accepted only when Tailscale says the caller IS that device, and the
         device is a member of this takt-net. Nothing in a report runs anything."""
         try:
-            host, rows = str(body["host"]).lower(), body["rows"]
-            if not isinstance(rows, list) or len(rows) > 500 or not all(isinstance(r, dict) for r in rows):
-                raise ValueError
+            host, rows = str(body["host"]).lower(), self.clean_rows(body["rows"])
         except (KeyError, TypeError, ValueError):
             return 400, "bad report"
         if host == self.net["self"] or host not in self.net["hosts"]:
@@ -1857,9 +1869,7 @@ class WebApp:
         who = self.whois(ip)
         if who != host:
             return 403, f"the tailnet says {ip} is {who or 'unknown'}, not {host}"
-        keep = ("id", "sched", "schedule", "status", "last", "next", "detail", "record")
-        rep_ = {"host": host, "received": self.now().isoformat(timespec="seconds"),
-                "rows": [{k: r.get(k) for k in keep} for r in rows]}
+        rep_ = {"host": host, "received": self.now().isoformat(timespec="seconds"), "rows": rows}
         d = self.state / "reports"
         with self.lock:  # two jobs of one device can report at once, on two server threads
             d.mkdir(parents=True, exist_ok=True)
@@ -1951,7 +1961,10 @@ class WebApp:
         row = next((r for r in rep_.get("rows", []) if r.get("id") == jid), None)
         if row is None:
             return 404, f"no report from {host} for {jid}"
-        text = format_record(jid, row.get("record")) if isinstance(row.get("record"), dict) else f"{jid}: never run"
+        try:
+            text = format_record(jid, row.get("record")) if isinstance(row.get("record"), dict) else f"{jid}: never run"
+        except (TypeError, AttributeError, KeyError, ValueError, IndexError):
+            return 502, f"{host} reported a record for {jid} that takt cannot read"
         return 200, f"{text}\n\n({host} {self.age(host)}; the log tails stay on {host})"
 
     def act(self, host, jid, verb):
@@ -1966,6 +1979,7 @@ class WebApp:
 def web_handler(app):
     class H(BaseHTTPRequestHandler):
         server_version = "takt"
+        timeout = 10  # a client that stops sending mid-request frees its thread
 
         def log_message(self, fmt, *args):
             if app.quiet:
@@ -2013,6 +2027,8 @@ def web_handler(app):
             if urlsplit(self.path).path == "/api/report":
                 try:
                     n = int(self.headers.get("Content-Length") or 0)
+                    if n < 0:
+                        raise ValueError("negative length")
                     if n > 2_000_000:
                         return self.send(413, "report too large")
                     body = json.loads(self.rfile.read(n) or b"{}")
@@ -2024,6 +2040,8 @@ def web_handler(app):
                 return self.send(404, "not found")
             try:
                 n = int(self.headers.get("Content-Length") or 0)
+                if n < 0:
+                    raise ValueError("negative length")
                 req = json.loads(self.rfile.read(min(n, 4096)) or b"{}")
                 host, jid, verb = str(req["host"]), str(req["id"]), str(req["verb"])
             except (ValueError, KeyError, TypeError):
@@ -2530,6 +2548,7 @@ def self_check():
         check_plans_apply(ok, tmp)
         check_web_reports(ok, tmp)
         check_pub_review1(ok, tmp)
+        check_pub_review2(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -4071,6 +4090,66 @@ def check_pub_review1(ok, tmp):
                        budget=8, clock=lambda: next(ticks))
     ok(res["a"] == "ok" and seen["lookup"] <= 3 and seen["post"] <= 5 and res["b"].startswith("skipped"),
        "report: lookup and HTTP share one deadline; a web host after it is skipped")
+
+
+def check_pub_review2(ok, tmp):
+    """Regressions for the second review of the public repo (2026-10-04)."""
+    import http.client
+    # a case twin installed from another jobs file is foreign too
+    la = tmp / "pr2-la"
+    la.mkdir()
+    (la / f"{PREFIX}.Foo.plist").write_bytes(render_launchd(mkjob("Foo", schedule="0 * * * *"), {**CTX, "spec": str(tmp / "pr2/a.toml")}))
+    b = tmp / "pr2/b.toml"
+    try:
+        plan_admin("install", {"foo": mkjob("foo", schedule="0 * * * *")}, "launchd", la, ["Foo"], {"Foo": (True, True)},
+                   ctx={**CTX, "state": str(tmp / "pr2st"), "spec": str(b)}, loaded={f"{PREFIX}.Foo"},
+                   owned=[i for i in ["Foo"] if installed_from("launchd", la, i, b)])
+        ok(False, "install: refuses foo when another jobs file installed Foo")
+    except ValueError:
+        ok(True, "")
+    # */7 cannot repeat across the hour on Task Scheduler
+    tr = schtasks_triggers(parse_cron("*/7 * * * *"))
+    ok(len(tr) == 9 and all(r == "PT1H" for _, _, r in tr) and schtasks_triggers(parse_cron("*/20 * * * *")) == [(0, 0, "PT20M")],
+       "schtasks: */7 is one hourly trigger per minute (restarts at :00); */20 still repeats")
+    # a leading hyphen would be an option in the wrapper command
+    try:
+        mkjob("-backup")
+        ok(False, "spec: an id that starts with - is refused")
+    except ValueError:
+        ok(True, "")
+    # reports: plain types only, on receive and on load; a bad record is an error, not a crash
+    net = {"self": "kvps", "hosts": {"kwin": {}}, "status": "master", "web": ["kvps"], "web_port": 0, "web_writes": False, "web_bind": {}}
+    st = tmp / "pr2-web"
+    app = WebApp(net, tmp / "x.toml", st, False, local_rows=lambda: [], whois=lambda ip: "kwin")
+    ok(app.receive("1", {"host": "kwin", "rows": [{"id": "j", "last": {"x": 1}, "status": ["ok"], "record": {"steps": [1]}}]}) == (200, "ok"),
+       "report: odd field types are accepted, reduced")
+    r = app.reports["kwin"]["rows"][0]
+    ok(isinstance(r["last"], str) and isinstance(r["status"], str), "report: a non-scalar field is kept as text")
+    ok(app.show("kwin", "j")[0] == 502, "report: a record takt cannot read is a 502, not an exception")
+    (st / "reports/kwin.json").write_text(json.dumps({"host": "kwin", "rows": [{"id": "j", "next": [1, 2], "record": "x"}]}))
+    (st / "reports/kbad.json").write_text("[1]")
+    again = WebApp(net, tmp / "x.toml", st, False, local_rows=lambda: [], whois=lambda ip: None)
+    ok(isinstance(again.reports["kwin"]["rows"][0]["next"], str) and again.reports["kwin"]["rows"][0]["record"] is None
+       and "kbad" not in again.reports, "report: a stored report is cleaned on load; a broken one is dropped")
+    # negative Content-Length is a bad request on both endpoints
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), web_handler(app))
+    app.quiet = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        codes = []
+        for path in ("/api/report", "/api/act"):
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            c.putrequest("POST", path)
+            c.putheader("X-Takt", "1")
+            c.putheader("Content-Length", "-1")
+            c.endheaders()
+            codes.append(c.getresponse().status)
+            c.close()
+        ok(codes == [400, 400], "web: a negative Content-Length is refused on both POST endpoints")
+        ok(web_handler(app).timeout == 10, "web: a stalled request times out")
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def check_plans_apply(ok, tmp):
