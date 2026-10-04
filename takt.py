@@ -1990,7 +1990,7 @@ def plan_web(be, ctx, agents_dir: Path, argv, loaded=None):
     elif be == "systemd":
         u = f"{WEB_UNIT}.service"
         if argv:
-            acts += [("write", f, render_web_systemd(argv, ctx)), ("run", ["systemctl", "--user", "daemon-reload"], None),
+            acts += [("write", f, render_web_systemd(argv, ctx).encode()), ("run", ["systemctl", "--user", "daemon-reload"], None),
                      ("run", ["systemctl", "--user", "enable", u], None), ("run", ["systemctl", "--user", "restart", u], None)]
         elif f.exists():
             acts += [("try", ["systemctl", "--user", "disable", "--now", u], None), ("rm", f, None),
@@ -2327,6 +2327,7 @@ def self_check():
         check_windows_jobs(ok, tmp)
         check_owned(ok, tmp)
         check_web(ok, tmp)
+        check_plans_apply(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -3706,6 +3707,22 @@ def check_web(ok, tmp):
     ok(app.rows()["rows"] == [], "web: settings.status = none shows no rows")
     ok(build_parser().parse_args(["web", "--bind", "127.0.0.1", "--port", "1"]).port == 1
        and "web" in starter_spec() and 'web = ["myvps"]' in starter_spec(), "web: the CLI has `web`, and takt init mentions it")
+
+
+def check_plans_apply(ok, tmp):
+    """Every install plan, with the web service, applies: each write is bytes and lands on disk.
+    (The systemd web unit was planned as text and crashed apply_plan on kvps, 2026-10-04.)"""
+    spec = {"j": mkjob("j", schedule="0 * * * *")}
+    for be in ("launchd", "systemd", "schtasks"):
+        d = tmp / f"apply-{be}"
+        ctx = {**CTX, "state": str(d / "state")}
+        acts = plan_admin("install", spec, be, d / "agents", [], {}, ctx=ctx, loaded=set(),
+                          web=["/usr/bin/python3", "/opt/takt/takt.py", "web"])
+        writes = [(a, b) for k, a, b in acts if k == "write"]
+        bad = [str(a) for a, b in writes if not isinstance(b, bytes)]
+        apply_plan(acts, lambda a, i: None)
+        ok(not bad and writes and all(a.exists() for a, _ in writes),
+           f"install {be}: every planned write (jobs and web service) is bytes and lands ({bad})")
 
 
 def check_windows_last(ok):
