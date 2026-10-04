@@ -41,6 +41,7 @@ A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`. 
 | `wants` | `[]` | Preflight checks. If one fails, takt records a warning and runs the job. |
 | `catch_up` | `"run-once"` | After a sleep, `run-once` runs a missed slot once. `skip` drops a start that is more than 5 minutes late. |
 | `run_at_load` | `false` | Also run the job when the scheduler loads it (at login). |
+| `on_event` | none | Windows only. An event query (the XML of a Task Scheduler event trigger) that also starts the job, for example a Remote Desktop session event. launchd and systemd refuse a job with `on_event`. |
 | `bundle` | none | macOS only. The `AssociatedBundleIdentifiers` value of the plist. |
 | `replaces` | `[]` | Old schedules that `install` retires. See [replaces](#replaces). |
 
@@ -79,7 +80,11 @@ Schedules use the clock of the host that runs the job.
 
 ## Preflight checks
 
-`needs` and `wants` take the same check names.
+`needs` and `wants` take the same check names. A check can also be a command as an argv list, which passes when it exits with 0:
+
+```toml
+needs = [["C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoProfile", "-File", "C:\\Users\\me\\bin\\wsl-running.ps1"]]
+```
 
 | Check | Passes when |
 |---|---|
@@ -104,6 +109,7 @@ The `needs` and `wants` checks of the ingest run after the refresh, so the refre
 |---|---|
 | `launchd:<label>` | Runs `launchctl bootout`, then moves the plist to `~/.local/state/takt/retired/`. |
 | `cron:<text>` | Saves the crontab to `~/.local/state/takt/crontab.bak`, then comments out each live line that contains `<text>`. |
+| `schtasks:<task>` | Windows. Ends the task, then disables it (`schtasks /Change /DISABLE`). The task stays, so `/ENABLE` brings it back. |
 
 `uninstall` does not restore these. The retired plist and the crontab backup stay in the state directory.
 

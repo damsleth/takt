@@ -200,7 +200,12 @@ def normalize(jid, j) -> dict:
            "after": list(j.get("after", [])), "needs": list(j.get("needs", [])),
            "wants": list(j.get("wants", [])), "bundle": j.get("bundle"),
            "lock_timeout": int(j.get("lock_timeout", 900)), "replaces": list(j.get("replaces", [])),
-           "steps": steps}
+           "on_event": j.get("on_event"), "steps": steps}
+    for n in job["needs"] + job["wants"]:  # "kind:arg", or a command as an argv list that passes on exit 0
+        if not (isinstance(n, str) or (isinstance(n, list) and n and all(isinstance(x, str) for x in n))):
+            raise ValueError(f"job {jid}: a need is \"kind:arg\" or an argv list, not {n!r}")
+    if job["on_event"] is not None and not isinstance(job["on_event"], str):
+        raise ValueError(f"job {jid}: on_event is an event query (XML text)")
     if job["schedule"] and next_slot(parse_cron(job["schedule"]), datetime(2000, 1, 1)) is None:
         raise ValueError(f"job {jid}: schedule {job['schedule']!r} never matches a date")
     if job["catch_up"] not in ("run-once", "skip"):
@@ -417,7 +422,18 @@ def owa_status():
         return None
 
 
+def need_label(need):
+    return need if isinstance(need, str) else ("cmd " + " ".join([Path(need[0]).name] + need[1:]))[:72]
+
+
 def check_need(need, cache):
+    if isinstance(need, list):  # a command: passes on exit 0
+        try:
+            r = subprocess.run(need, capture_output=True, text=True, timeout=60, **NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"{need[0]}: {e}"
+        last = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+        return r.returncode == 0, f"exit {r.returncode}" + (f": {last[-1][:120]}" if last else "")
     kind, _, arg = need.partition(":")
     if kind == "fda":
         path = Path(arg or "~/Library/Messages/chat.db").expanduser()
@@ -467,7 +483,7 @@ def preflight(job, cache=None):
     for hard, key in ((True, "needs"), (False, "wants")):
         for n in job[key]:
             ok, detail = check_need(n, cache)
-            rows.append({"need": n, "hard": hard, "ok": ok, "detail": detail})
+            rows.append({"need": need_label(n), "hard": hard, "ok": ok, "detail": detail})
     return rows
 
 
@@ -774,7 +790,13 @@ def launchd_schedule(f):
     return ("cal", [dict(zip([k for k, _ in keys], combo)) for combo in product(*[v for _, v in keys])])
 
 
+def windows_only(job, backend):
+    if job.get("on_event"):
+        raise ValueError(f"job {job['id']}: on_event is Windows-only; {backend} has no event triggers")
+
+
 def render_launchd(job, ctx) -> bytes:
+    windows_only(job, "launchd")
     d = {"Label": f"{PREFIX}.{job['id']}", "ProgramArguments": wrapper_argv(ctx, job["id"]),
          "EnvironmentVariables": {"PATH": ctx["path"]},
          "StandardOutPath": f"{ctx['state']}/log/{job['id']}.log",
@@ -837,6 +859,7 @@ def sd_field(s, lo, pad):
 def render_systemd(job, ctx):
     """-> (service text, timer text or None). A job with no schedule and no run_at_load is
     manual-only: systemd rejects a timer without a trigger, so it gets the service alone."""
+    windows_only(job, "systemd")
     unit = f"takt-{job['id']}"
     argv = " ".join(sd_quote(a) for a in wrapper_argv(ctx, job["id"]))
     service = (f"[Unit]\nDescription=takt job {job['id']}\n\n[Service]\nType=oneshot\n"
@@ -924,6 +947,10 @@ def render_schtasks(job, ctx) -> str:
                 _sub(_sub(t, "ScheduleByDay"), "DaysInterval", 1)
     if job["run_at_load"]:
         _sub(_sub(trig, "LogonTrigger"), "Enabled", "true")
+    if job.get("on_event"):  # e.g. a Remote Desktop session event; the query is XML text, escaped by ElementTree
+        ev = _sub(trig, "EventTrigger")
+        _sub(ev, "Enabled", "true")
+        _sub(ev, "Subscription", job["on_event"])
     if len(trig) > SCHTASKS_MAX_TRIGGERS:  # registration would fail; refuse while planning, before any change
         raise ValueError(f"job {job['id']}: schedule {job['schedule']!r} needs {len(trig)} Task Scheduler triggers; "
                          f"a task can have at most {SCHTASKS_MAX_TRIGGERS}")
@@ -948,6 +975,9 @@ def stage(spec, ctx, out: Path, backends):
         d = out / b
         d.mkdir(parents=True, exist_ok=True)
         for j in spec.values():
+            if b != "schtasks" and j.get("on_event"):
+                print(f"skip {b}/{j['id']}: on_event is Windows-only", file=sys.stderr)
+                continue
             if b == "launchd":
                 files = {f"{PREFIX}.{j['id']}.plist": render_launchd(j, ctx)}
             elif b == "systemd":
@@ -1118,6 +1148,9 @@ def plan_install(spec, ctx, agents_dir: Path, crontab_text: str, be="launchd", l
                     booted.add(arg)
                     acts.append(("run" if loaded is not None else "try", ["launchctl", "bootout", f"gui/{uid}/{arg}"], None))
                 acts.append(("move", old, Path(ctx["state"]) / "retired" / old.name))
+            elif kind == "schtasks" and be == "schtasks":  # disabled, not deleted: /ENABLE brings it back
+                acts.append(("run", ["schtasks", "/End", "/TN", arg], None))
+                acts.append(("run", ["schtasks", "/Change", "/TN", arg, "/DISABLE"], None))
             elif kind == "cron":
                 for k, line in enumerate(new_cron):
                     if not line.lstrip().startswith("#") and arg in line:
@@ -1209,16 +1242,31 @@ def plan_uninstall(ids, agents_dir: Path, be, nat):
     return acts
 
 
-def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab="", loaded=None):
-    """install: retire the takt jobs the spec no longer names, then install the spec.
-    uninstall: the given ids, or every job in the spec and every takt job registered here."""
+def installed_from(be, agents_dir: Path, jid, spec_path):
+    """The installed unit of `jid` runs `--spec <spec_path>`: it belongs to this jobs file. A job
+    installed from another file (a second `--spec`, another tool's jobs) is someone else's."""
+    f = agents_dir / {"launchd": f"{PREFIX}.{jid}.plist", "systemd": f"takt-{jid}.service"}.get(be, f"takt-{jid}.xml")
+    try:
+        raw = f.read_bytes()
+    except OSError:
+        return False
+    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode(errors="replace")
+    return str(spec_path) in text
+
+
+def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab="", loaded=None, owned=None):
+    """install: retire the jobs of this jobs file that it no longer names, then install the file.
+    uninstall: the given ids, or every job in the file and every job installed from it.
+    `owned`: the registered ids installed from this jobs file (installed_from). A job from another
+    file is never retired or removed implicitly."""
+    owned = known if owned is None else owned
     if cmd == "install":
-        stale = [i for i in known if i not in spec]
+        stale = [i for i in owned if i not in spec]
         if loaded is not None:  # retired below: a `replaces` naming one of them must not boot it out again
             loaded = loaded - {f"{PREFIX}.{i}" for i in stale}
         return (plan_uninstall(stale, agents_dir, be, nat)
                 + plan_install(spec, ctx, agents_dir, crontab, be, loaded))
-    return plan_uninstall(list(ids or sorted(set(spec) | set(known))), agents_dir, be, nat)
+    return plan_uninstall(list(ids or sorted(set(spec) | set(owned))), agents_dir, be, nat)
 
 
 def describe(act):
@@ -1803,9 +1851,11 @@ def main(argv=None):
             print(f"failed: {e}. Nothing changed.", file=sys.stderr)
             return 1
         try:
+            spec_path = Path(a.spec).resolve()
             acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
                               ctx=make_ctx(a) if a.cmd == "install" else None,
-                              crontab=read_crontab(spec) if a.cmd == "install" else "", loaded=loaded)
+                              crontab=read_crontab(spec) if a.cmd == "install" else "", loaded=loaded,
+                              owned=[i for i in known if installed_from(be, adir, i, spec_path)])
         except ValueError as e:  # a job the scheduler cannot take: nothing has changed yet
             print(f"failed: {e}. Nothing changed.", file=sys.stderr)
             return 1
@@ -1860,6 +1910,8 @@ def self_check():
         check_review10(ok, tmp)
         check_owa_reseed(ok, tmp)
         check_status_scope(ok, tmp)
+        check_windows_jobs(ok, tmp)
+        check_owned(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2952,6 +3004,80 @@ def check_status_scope(ok, tmp):
             ok(True, "")
     finally:
         g["CONFIG"] = saved
+
+
+def check_windows_jobs(ok, tmp):
+    """Command preflights, on_event triggers, and replaces = ["schtasks:..."]."""
+    passing, failing = [PY, "-c", "pass"], [PY, "-c", "import sys; print('wsl is not running'); sys.exit(3)"]
+    ok(check_need(passing, {})[0] and check_need(failing, {}) == (False, "exit 3: wsl is not running"),
+       "preflight: a command need passes on exit 0 and reports the exit code and last line")
+    ok(not check_need(["takt-no-such-binary-xyz"], {})[0], "preflight: a missing command fails the need")
+    d = tmp / "winjobs"
+    d.mkdir()
+    mk = d / "m.txt"
+    sp = {"w": mkjob("w", needs=[failing], command=cmd_mark(mk, "w", 0))}
+    run_job(sp, "w", d / "st", say=lambda *_: None)
+    r = read_record(d / "st", "w")
+    ok(r["status"] == "skipped" and "w" not in marks(mk) and f"needs cmd {Path(PY).name} -c" in r["note"],
+       "preflight: a failing command need skips the job and names the command")
+    for bad in (3, [], [1, 2]):
+        try:
+            mkjob("x", needs=[bad])
+            ok(False, f"spec: need {bad!r} is rejected")
+        except ValueError:
+            ok(True, "")
+
+    sub = "<QueryList><Query Id='0' Path='Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'>" \
+          "<Select>*[System[(EventID=21 or EventID=25)]]</Select></Query></QueryList>"
+    j = mkjob("e", run_at_load=True, on_event=sub)
+    x = ET.fromstring(render_schtasks(j, CTX))
+    trig = x.find(f"{{{TS_NS}}}Triggers")
+    ev = trig.find(f"{{{TS_NS}}}EventTrigger")
+    ok(ev is not None and ev.find(f"{{{TS_NS}}}Subscription").text == sub and len(trig) == 2,
+       "schtasks: on_event adds an EventTrigger with the query, next to the logon trigger")
+    for render in (lambda: render_launchd(j, CTX), lambda: render_systemd(j, CTX)):
+        try:
+            render()
+            ok(False, "launchd/systemd: on_event is refused")
+        except ValueError:
+            ok(True, "")
+    import contextlib
+    import io
+    with contextlib.redirect_stderr(io.StringIO()):
+        made = stage({"e": j, "p": mkjob("p", schedule="0 * * * *")}, CTX, d / "stage", ["launchd", "schtasks"])
+    ok(sorted(m.name for m in made) == sorted([f"{PREFIX}.p.plist", "takt-e.xml", "takt-p.xml"]),
+       "render: a Windows-only job is skipped for launchd, rendered for schtasks")
+
+    acts = plan_install({"n": mkjob("n", schedule="*/10 * * * *", replaces=["schtasks:\\Old-Task"])},
+                        {**CTX, "state": str(d / "ist")}, d / "x", "", "schtasks")
+    runs = [a[:3] + a[3:4] for k, a, _ in acts if k == "run"]
+    ok(runs[:2] == [["schtasks", "/End", "/TN", "\\Old-Task"], ["schtasks", "/Change", "/TN", "\\Old-Task"]]
+       and acts[[k for k, *_ in acts].index("run") + 1][1][-1] == "/DISABLE" and runs[2][:2] == ["schtasks", "/Create"],
+       "install schtasks: replaces ends and disables the old task before creating the new one")
+
+
+def check_owned(ok, tmp):
+    """install/uninstall touch only the jobs installed from the same jobs file."""
+    la = tmp / "owned-la"
+    la.mkdir()
+    one, two = tmp / "specs/one.toml", tmp / "specs/two.toml"
+    for jid, spec_path in (("a", one), ("b", two)):
+        ctx = {**CTX, "spec": str(spec_path)}
+        (la / f"{PREFIX}.{jid}.plist").write_bytes(render_launchd(mkjob(jid, schedule="0 * * * *"), ctx))
+    ok(installed_from("launchd", la, "a", one) and not installed_from("launchd", la, "a", two)
+       and not installed_from("launchd", la, "zzz", one), "owned: a job belongs to the jobs file its plist runs")
+    x = tmp / "owned-x"
+    x.mkdir()
+    (x / "takt-w.xml").write_bytes(render_schtasks(mkjob("w", schedule="0 * * * *"), {**CTX, "spec": str(two)}).encode("utf-16"))
+    ok(installed_from("schtasks", x, "w", two), "owned: the task XML (UTF-16) names its jobs file")
+    nat = {"a": (True, True), "b": (True, True)}
+    owned = [i for i in ("a", "b") if installed_from("launchd", la, i, two)]
+    acts = plan_admin("install", {"c": mkjob("c", schedule="0 * * * *")}, "launchd", la, ["a", "b"], nat,
+                      ctx={**CTX, "state": str(tmp / "owned-st"), "spec": str(two)}, loaded={f"{PREFIX}.a", f"{PREFIX}.b"}, owned=owned)
+    gone = [Path(a).name for k, a, _ in acts if k == "rm"]
+    ok(gone == [f"{PREFIX}.b.plist"], "install: retires only the stale jobs of its own jobs file")
+    un = plan_admin("uninstall", {}, "launchd", la, ["a", "b"], nat, owned=owned)
+    ok([Path(a).name for k, a, _ in un if k == "rm"] == [f"{PREFIX}.b.plist"], "uninstall: removes only its own jobs file's jobs")
 
 
 def check_windows_last(ok):
