@@ -39,7 +39,7 @@ A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`. 
 | `after` | `[]` | Job ids that must run first when they are due in the same slot. |
 | `needs` | `[]` | Preflight checks. If one fails, takt skips the job and records why. |
 | `wants` | `[]` | Preflight checks. If one fails, takt records a warning and runs the job. |
-| `catch_up` | `"run-once"` | After a sleep, `run-once` runs a missed slot once. `skip` drops a start that is more than 5 minutes late. |
+| `catch_up` | `"run-once"` | After a sleep, `run-once` runs a missed slot once. `skip` drops a start that is more than 5 minutes late. `skip` cannot be used with `run_at_load` or `on_event`, because takt cannot tell those starts from a late slot. |
 | `run_at_load` | `false` | Also run the job when the scheduler loads it (at login). |
 | `on_event` | none | Windows only. An event query (the XML of a Task Scheduler event trigger) that also starts the job, for example a Remote Desktop session event. launchd and systemd refuse a job with `on_event`. |
 | `bundle` | none | macOS only. The `AssociatedBundleIdentifiers` value of the plist. |

@@ -212,6 +212,11 @@ def normalize(jid, j) -> dict:
             raise ValueError(f"job {jid}: a need is \"kind:arg\" or an argv list, not {n!r}")
     if job["on_event"] is not None and not isinstance(job["on_event"], str):
         raise ValueError(f"job {jid}: on_event is an event query (XML text)")
+    if job["catch_up"] == "skip" and (job["run_at_load"] or job["on_event"]):
+        # the scheduler starts every trigger with the same command, so a logon or event start would
+        # look like a late scheduled start and be dropped
+        raise ValueError(f"job {jid}: catch_up = \"skip\" cannot tell a missed slot from a logon or event start; "
+                         "use run-once with run_at_load or on_event")
     if job["schedule"] and next_slot(parse_cron(job["schedule"]), datetime(2000, 1, 1)) is None:
         raise ValueError(f"job {jid}: schedule {job['schedule']!r} never matches a date")
     if job["catch_up"] not in ("run-once", "skip"):
@@ -1252,13 +1257,33 @@ def plan_uninstall(ids, agents_dir: Path, be, nat):
 def installed_from(be, agents_dir: Path, jid, spec_path):
     """The installed unit of `jid` runs `--spec <spec_path>`: it belongs to this jobs file. A job
     installed from another file (a second `--spec`, another tool's jobs) is someone else's."""
+    found = installed_spec(be, agents_dir, jid)
+    return found is not None and same_path(found, spec_path)
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def installed_spec(be, agents_dir: Path, jid):
+    """The --spec value in the installed unit of `jid` (plist ProgramArguments, systemd ExecStart,
+    task XML Arguments), parsed rather than searched, or None."""
     f = agents_dir / {"launchd": f"{PREFIX}.{jid}.plist", "systemd": f"takt-{jid}.service"}.get(be, f"takt-{jid}.xml")
     try:
         raw = f.read_bytes()
-    except OSError:
-        return False
-    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode(errors="replace")
-    return str(spec_path) in text
+        if be == "launchd":
+            args = [str(x) for x in plistlib.loads(raw).get("ProgramArguments", [])]
+        else:
+            text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode(errors="replace")
+            if be == "systemd":
+                line = next((x for x in text.splitlines() if x.startswith("ExecStart=")), "")[len("ExecStart="):]
+            else:
+                el = ET.fromstring(text).find(f".//{{{TS_NS}}}Arguments")
+                line = el.text or "" if el is not None else ""
+            args = [q or w for q, w in re.findall(r'"([^"]*)"|(\S+)', line)]  # sd_quote: "..." around spaces
+        return args[args.index("--spec") + 1]
+    except (OSError, ValueError, IndexError, plistlib.InvalidFileException, ET.ParseError):
+        return None
 
 
 def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab="", loaded=None, owned=None,
@@ -1270,14 +1295,19 @@ def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, 
     `web`: None leaves the web service alone; a command list installs it (install only); False
     retires it (install on a device that is not a web host, and uninstall without ids)."""
     owned = known if owned is None else owned
+    foreign = [i for i in spec if i in known and i not in owned]  # same id, installed from another jobs file
     if cmd == "install":
+        if foreign:
+            raise ValueError(f"{', '.join(foreign)}: installed from another jobs file. Rename the job here, or "
+                             "uninstall it with that file first")
         stale = [i for i in owned if i not in spec]
         if loaded is not None:  # retired below: a `replaces` naming one of them must not boot it out again
             loaded = loaded - {f"{PREFIX}.{i}" for i in stale}
         return (plan_uninstall(stale, agents_dir, be, nat)
                 + plan_install(spec, ctx, agents_dir, crontab, be, loaded)
                 + (plan_web(be, ctx, agents_dir, web or None, loaded) if web is not None else []))
-    return (plan_uninstall(list(ids or sorted(set(spec) | set(owned))), agents_dir, be, nat)
+    targets = list(ids) if ids else sorted({i for i in spec if i not in foreign} | set(owned))
+    return (plan_uninstall(targets, agents_dir, be, nat)
             + (plan_web(be, ctx, agents_dir, None, loaded) if web is not None and not ids else []))
 
 
@@ -1713,9 +1743,10 @@ def web_settings(cfg, me):
         raise ValueError("settings.web_bind: a table of device name = address")
     for k, v in binds.items():
         try:
-            ipaddress.ip_address(v)
+            if ipaddress.ip_address(v).version != 4:
+                raise ValueError
         except ValueError:
-            raise ValueError(f"settings.web_bind.{k} {v!r}: use an IP address") from None
+            raise ValueError(f"settings.web_bind.{k} {v!r}: use an IPv4 address") from None
     return {"web": [me if n == "local" else n for n in names], "web_port": port,
             "web_writes": bool(cfg.get("web_writes", False)), "web_bind": dict(binds)}
 
@@ -1726,14 +1757,14 @@ def web_scope(net):
     return "off" if net["status"] == "none" else "net"
 
 
-def tailscale_ip(run=subprocess.run, which=shutil.which, isfile=os.path.isfile, peer=None):
+def tailscale_ip(run=subprocess.run, which=shutil.which, isfile=os.path.isfile, peer=None, timeout=10):
     """This machine's Tailscale IPv4 address (or `peer`'s, by its machine name), or None. Tries the
     CLI on PATH, then the app paths. Works without MagicDNS."""
     for c in [which("tailscale"), *TAILSCALE_BINS]:
         if not c or not isfile(c):
             continue
         try:
-            out = run([c, "ip", "-4", *([peer] if peer else [])], capture_output=True, text=True, timeout=10,
+            out = run([c, "ip", "-4", *([peer] if peer else [])], capture_output=True, text=True, timeout=timeout,
                       **NO_WINDOW).stdout
         except (OSError, subprocess.SubprocessError):
             continue
@@ -1769,9 +1800,11 @@ def web_bind_addr(arg, net, finder=tailscale_ip):
         sys.exit("takt web: no Tailscale address (is tailscale up?). Set --bind, or [settings.web_bind] "
                  f"{net['self']} = \"<address>\" in the jobs file.")
     try:
-        ipaddress.ip_address(addr)
+        ip = ipaddress.ip_address(addr)
     except ValueError:
         sys.exit(f"takt web: bad address {addr!r}")
+    if ip.version == 6:
+        sys.exit(f"takt web: {addr} is IPv6; the server listens on IPv4 only (use the Tailscale IPv4 address)")
     return addr
 
 
@@ -1828,11 +1861,11 @@ class WebApp:
         rep_ = {"host": host, "received": self.now().isoformat(timespec="seconds"),
                 "rows": [{k: r.get(k) for k in keep} for r in rows]}
         d = self.state / "reports"
-        d.mkdir(parents=True, exist_ok=True)
-        tmp = d / f".{host}.{os.getpid()}.tmp"
-        tmp.write_text(json.dumps(rep_))
-        os.replace(tmp, d / f"{host}.json")
-        with self.lock:
+        with self.lock:  # two jobs of one device can report at once, on two server threads
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / f".{host}.{os.getpid()}.{threading.get_ident()}.tmp"
+            tmp.write_text(json.dumps(rep_))
+            os.replace(tmp, d / f"{host}.json")
             self.reports[host] = rep_
             self.cache = (0.0, None)
         return 200, "ok"
@@ -2000,28 +2033,38 @@ def web_handler(app):
     return H
 
 
-def web_target(net, host, finder=tailscale_ip):
+def web_target(net, host, finder=tailscale_ip, timeout=3):
     """Where to reach the web host `host`: settings.web_bind, else its Tailscale address (no MagicDNS
     needed), else the name itself."""
-    addr = net.get("web_bind", {}).get(host) or finder(peer=host) or host
+    addr = net.get("web_bind", {}).get(host) or finder(peer=host, timeout=timeout) or host
     return f"http://{'[' + addr + ']' if ':' in addr else addr}:{net.get('web_port', WEB_PORT)}/api/report"
 
 
-def send_reports(net, rows, post=None, finder=tailscale_ip):
-    """POST this device's rows to every web host but itself. Best effort, 5 s per host: a web host
-    that is down never fails a job. -> {web host: "ok" or the error}."""
-    def post_(url, body):
+REPORT_BUDGET = 8  # seconds for one report to every web host: address lookups and HTTP together
+
+
+def send_reports(net, rows, post=None, finder=tailscale_ip, budget=REPORT_BUDGET, clock=time.monotonic):
+    """POST this device's rows to every web host but itself. Best effort, and `budget` seconds at most
+    in all (lookup 3 s, HTTP 5 s each, within the budget): a web host that is down never fails a job
+    or holds its wrapper. -> {web host: "ok" or the error}."""
+    def post_(url, body, timeout):
         req = urllib.request.Request(url, data=body, headers={"X-Takt": "1", "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status
     post = post or post_
     body = json.dumps({"host": net["self"], "rows": rows}).encode()
-    out = {}
+    out, t0 = {}, clock()
     for h in net.get("web", []):
         if h == net["self"]:
             continue
+        left = budget - (clock() - t0)
+        if left < 0.5:
+            out[h] = f"skipped: the report used its {budget} s"
+            continue
         try:
-            out[h] = "ok" if post(web_target(net, h, finder), body) == 200 else "refused"
+            url = web_target(net, h, finder, timeout=min(3, left))
+            left = budget - (clock() - t0)
+            out[h] = "ok" if post(url, body, max(0.5, min(5, left))) == 200 else "refused"
         except Exception as e:  # noqa: BLE001  any failure is a line in the log, never a failed job
             out[h] = f"{type(e).__name__}: {e}"
     return out
@@ -2049,7 +2092,7 @@ def web_main(a):
     addr = web_bind_addr(a.bind, net)
     if ipaddress.ip_address(addr).is_unspecified:
         print("takt web: warning: this address listens on every interface, not only the tailnet", file=sys.stderr)
-    app = WebApp(net, a.spec, state_dir(a), a.allow_writes)
+    app = WebApp(net, a.spec, state_dir(a), a.allow_writes or net.get("web_writes", False))
     srv = ThreadingHTTPServer((addr, port), web_handler(app))
     srv.daemon_threads = True
     shown = f"[{addr}]" if ":" in addr else addr
@@ -2486,6 +2529,7 @@ def self_check():
         check_web(ok, tmp)
         check_plans_apply(ok, tmp)
         check_web_reports(ok, tmp)
+        check_pub_review1(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2552,8 +2596,9 @@ def check_render(ok):
                "Persistent=true\nUnit=takt-yaams-ingest.service\n\n[Install]\nWantedBy=timers.target\n"),
        "systemd timer golden (0 */2)")
     ok("OnCalendar=*-*-* *:00/15:00" in render_systemd(mkjob("q", schedule="*/15 * * * *"), c)[1], "systemd */15")
-    t2 = render_systemd(mkjob("w", schedule="30 6 * * 1,2", catch_up="skip", run_at_load=True), c)[1]
-    ok("OnCalendar=Mon,Tue *-*-* 06:30:00" in t2 and "Persistent" not in t2 and "OnActiveSec=5s" in t2,
+    t2 = render_systemd(mkjob("w", schedule="30 6 * * 1,2", catch_up="skip"), c)[1]
+    t3 = render_systemd(mkjob("w", schedule="30 6 * * 1,2", catch_up="run-once", run_at_load=True), c)[1]
+    ok("OnCalendar=Mon,Tue *-*-* 06:30:00" in t2 and "Persistent" not in t2 and "OnActiveSec=5s" in t3,
        "systemd weekday, skip has no Persistent, run_at_load")
 
     x = render_schtasks(yaams, c)
@@ -3901,15 +3946,16 @@ def check_web_reports(ok, tmp):
 
     sent = []
 
-    def post(url, body):
-        sent.append((url, json.loads(body)))
+    def post(url, body, timeout=5):
+        sent.append((url, json.loads(body), timeout))
         return 200
     res = send_reports({"self": "kwin", "web": ["kvps", "kwin"], "web_port": 8787, "web_bind": {}}, [{"id": "a"}],
-                       post=post, finder=lambda peer=None: {"kvps": "100.68.171.58"}.get(peer))
-    ok(res == {"kvps": "ok"} and sent == [("http://100.68.171.58:8787/api/report", {"host": "kwin", "rows": [{"id": "a"}]})],
+                       post=post, finder=lambda peer=None, timeout=None: {"kvps": "100.68.171.58"}.get(peer))
+    ok(res == {"kvps": "ok"} and [x[:2] for x in sent] == [("http://100.68.171.58:8787/api/report", {"host": "kwin", "rows": [{"id": "a"}]})]
+       and sent[0][2] <= 5,
        "report: a device sends its rows to every web host but itself, at its Tailscale address")
 
-    def down(url, body):
+    def down(url, body, timeout=5):
         raise urllib.error.URLError("connection refused")
     res = send_reports({"self": "kwin", "web": ["kvps"], "web_port": 8787, "web_bind": {"kvps": "10.0.0.5"}}, [], post=down)
     ok(res["kvps"].startswith("URLError") , "report: a web host that is down is an error string, never an exception")
@@ -3922,6 +3968,109 @@ def check_web_reports(ok, tmp):
            "report: only a run of this device's own jobs file reports, and TAKT_NO_REPORT turns it off")
     finally:
         g["CONFIG"] = saved
+
+
+def check_pub_review1(ok, tmp):
+    """Regressions for the first review of the public repo (2026-10-04)."""
+    import contextlib
+    import io
+    # ownership: overlapping ids, and whole-path matching
+    la = tmp / "pr1-la"
+    la.mkdir()
+    a_spec, b_spec, backup = tmp / "pr1/a.toml", tmp / "pr1/b.toml", tmp / "pr1/b.toml.backup"
+    (la / f"{PREFIX}.shared.plist").write_bytes(render_launchd(mkjob("shared", schedule="0 * * * *"), {**CTX, "spec": str(a_spec)}))
+    nat = {"shared": (True, True)}
+    owned_b = [i for i in ["shared"] if installed_from("launchd", la, i, b_spec)]
+    try:
+        plan_admin("install", {"shared": mkjob("shared", schedule="0 * * * *")}, "launchd", la, ["shared"], nat,
+                   ctx={**CTX, "state": str(tmp / "pr1st"), "spec": str(b_spec)}, loaded={f"{PREFIX}.shared"}, owned=owned_b)
+        ok(False, "install: refuses a job id that another jobs file installed")
+    except ValueError as e:
+        ok("another jobs file" in str(e), "install: refuses a job id that another jobs file installed")
+    un = plan_admin("uninstall", {"shared": mkjob("shared")}, "launchd", la, ["shared"], nat, owned=owned_b)
+    ok(un == [], "uninstall: leaves a same-named job of another jobs file alone")
+    (la / f"{PREFIX}.bk.plist").write_bytes(render_launchd(mkjob("bk", schedule="0 * * * *"), {**CTX, "spec": str(backup)}))
+    amp = tmp / "pr1/R&D.toml"
+    (la / f"{PREFIX}.amp.plist").write_bytes(render_launchd(mkjob("amp", schedule="0 * * * *"), {**CTX, "spec": str(amp)}))
+    sd = tmp / "pr1-sd"
+    sd.mkdir()
+    spaced = tmp / "pr1/with space.toml"
+    (sd / "takt-sp.service").write_text(render_systemd(mkjob("sp", schedule="0 * * * *"), {**CTX, "spec": str(spaced)})[0])
+    ok(not installed_from("launchd", la, "bk", b_spec) and installed_from("launchd", la, "amp", amp)
+       and installed_from("systemd", sd, "sp", spaced) and not installed_from("systemd", sd, "sp", tmp / "pr1/with"),
+       "owned: whole paths, parsed from the unit (no prefix match; & and spaces are fine)")
+
+    # concurrent reports of one device
+    net = {"self": "kvps", "hosts": {"kwin": {}}, "status": "master", "web": ["kvps"], "web_port": 0, "web_writes": False, "web_bind": {}}
+    app = WebApp(net, tmp / "x.toml", tmp / "pr1-web", False, local_rows=lambda: [], whois=lambda ip: "kwin")
+    results, bar = [], threading.Barrier(8)
+
+    def one(i):
+        bar.wait()
+        results.append(app.receive("100.1.1.2", {"host": "kwin", "rows": [{"id": f"j{i}"}]}))
+    ts = [threading.Thread(target=one, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    saved = json.loads((tmp / "pr1-web/reports/kwin.json").read_text())
+    ok(results == [(200, "ok")] * 8 and len(saved["rows"]) == 1, "report: 8 concurrent reports of one device all land, one file")
+
+    # catch_up = "skip" with a logon or event trigger
+    for kw in ({"run_at_load": True}, {"on_event": "<QueryList/>"}):
+        try:
+            mkjob("x", schedule="0 3 * * *", catch_up="skip", **kw)
+            ok(False, f"spec: catch_up = skip with {list(kw)[0]} is refused")
+        except ValueError:
+            ok(True, "")
+
+    # web: IPv6 refused, web_writes honoured by a manual start
+    try:
+        web_bind_addr("::1", {"self": "x", "web_bind": {}})
+        ok(False, "web: an IPv6 bind is refused")
+    except SystemExit as e:
+        ok("IPv6" in str(e), "web: an IPv6 bind is refused")
+    try:
+        web_settings({"web_bind": {"x": "fd7a::1"}}, "x")
+        ok(False, "web: an IPv6 web_bind is refused")
+    except ValueError:
+        ok(True, "")
+    made = []
+    g = globals()
+    saved_app, saved_srv, saved_net = g["WebApp"], g["ThreadingHTTPServer"], g["net_settings"]
+
+    class Stop(Exception):
+        pass
+
+    def fake_srv(*a, **k):
+        raise Stop
+    try:
+        g["WebApp"] = lambda net, spec, state, writes, **k: made.append(writes)
+        g["ThreadingHTTPServer"] = fake_srv
+        g["net_settings"] = lambda: {"self": "x", "hosts": {}, "status": "master", "web": ["x"], "web_port": 1,
+                                     "web_writes": True, "web_bind": {}}
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                web_main(build_parser().parse_args(["web", "--bind", "127.0.0.1"]))
+        except Stop:
+            pass
+    finally:
+        g["WebApp"], g["ThreadingHTTPServer"], g["net_settings"] = saved_app, saved_srv, saved_net
+    ok(made == [True], "web: a manual `takt web` honours web_writes = true")
+
+    # reports: one deadline for lookup and HTTP
+    seen = {}
+
+    def finder(peer=None, timeout=None):
+        seen.setdefault("lookup", timeout)
+        return "100.1.1.1"
+
+    def post(url, body, timeout=None):
+        seen.setdefault("post", timeout)
+        return 200
+    ticks = iter([0, 0, 7.8, 7.9, 8.6])
+    res = send_reports({"self": "kwin", "web": ["a", "b"], "web_port": 1, "web_bind": {}}, [], post=post, finder=finder,
+                       budget=8, clock=lambda: next(ticks))
+    ok(res["a"] == "ok" and seen["lookup"] <= 3 and seen["post"] <= 5 and res["b"].startswith("skipped"),
+       "report: lookup and HTTP share one deadline; a web host after it is skipped")
 
 
 def check_plans_apply(ok, tmp):

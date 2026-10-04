@@ -37,7 +37,7 @@ The login shell on the host can be `sh` or PowerShell, and ssh joins arguments w
 
 ## Web dashboard on a host
 
-A host named in `[settings] web` also gets a web service from `install`. It pulls the rows of the other devices over ssh, so it needs ssh access to each of them. See [web.md](web.md#ssh-from-the-web-device).
+A host named in `[settings] web` also gets a web service from `install`. The other devices send their rows to it over HTTP after each run, so it needs no ssh access to them. See [web.md](web.md#reports-from-the-other-devices).
 
 ## Linux hosts
 

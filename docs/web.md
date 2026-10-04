@@ -17,7 +17,7 @@ web = ["myvps"]          # device names. "local" means the controller itself.
 # myvps = "100.64.0.7"
 ```
 
-Use more than one name to serve the page from more than one device. `push` and `install` copy these settings to each host in `net.toml`, in the same way as `settings.status`. After you change them, run `takt --host <h> install --allow-writes` for each host that serves the page or that stops serving it.
+Use more than one name to serve the page from more than one device. `push` and `install` copy these settings to each host in `net.toml`, in the same way as `settings.status`. After you change them, run `takt --host <h> install --allow-writes` for each host that serves the page or that stops serving it, and `takt --host <h> push --allow-writes` for every other host. A device reads the list of web devices from its own `net.toml`, so a device that you do not update sends its rows nowhere.
 
 ## Install
 
@@ -53,7 +53,7 @@ takt takes the first of these:
 2. `[settings.web_bind]` for this device.
 3. The Tailscale address.
 
-If none gives an address, the server prints the reason and exits. The service manager starts it again 10 seconds later, so the server comes up when Tailscale does. takt never listens on all interfaces unless you pass `--bind 0.0.0.0`, and it prints a warning then.
+If none gives an address, the server prints the reason and exits. The service manager starts it again 10 seconds later, so the server comes up when Tailscale does. takt never listens on all interfaces unless you pass `--bind 0.0.0.0`, and it prints a warning then. The address must be IPv4: takt refuses an IPv6 address.
 
 The page is at `http://<address>:<port>/`. The MagicDNS name of the device works too.
 
@@ -71,7 +71,7 @@ The web device does not log in to other devices. Each device sends its own rows 
 
 - After each run of a job from its own jobs file (`~/.config/takt/jobs.toml`), the wrapper sends `POST /api/report` to each web device in `settings.web`. A test run or a run from another `--spec` file does not report.
 - `takt report` sends the rows now.
-- A send waits 5 seconds at most. If the web device does not answer, the job is not affected, and the error goes to the log of the job. The next run sends the full rows again.
+- All sends of one run share a budget of 8 seconds, address lookups included. A web device that is left when the budget is spent is skipped. If the web device does not answer, the job is not affected, and the error goes to the log of the job. The next run sends the full rows again.
 - The device finds the web device with `tailscale ip -4 <name>`, so MagicDNS is not necessary. `[settings.web_bind]` overrides the address.
 
 The web device accepts a report only if Tailscale confirms the sender. It runs `tailscale whois` on the address of the caller. The first part of the machine name (`kmbp` in `kmbp.example.ts.net`) must be the device that the report names, and that device must be a member of the takt-net. If Tailscale does not know the address, or if the `tailscale` command is missing, the report is refused. A report holds rows only. It cannot run anything.
