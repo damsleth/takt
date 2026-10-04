@@ -91,6 +91,10 @@ The TUI is [fzf](https://github.com/junegunn/fzf) over `takt status -A`. The bot
 
 The result of a key shows in the footer.
 
+## Upgrade
+
+Upgrade takt while no job runs. A wrapper that already runs keeps the version that it started with, and a new version can use other lock file names. To upgrade, disable the jobs or wait for their runs to end, run the installer again (or `takt --host <h> push --allow-writes`), then run `takt install --allow-writes`.
+
 ## Checks
 
 | Command | What it does |
