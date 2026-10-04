@@ -16,6 +16,7 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 | `takt show <id>` | Shows the last record of a job: steps, exit codes, step notes, preflight, and the end of its logs. |
 | `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. If the job is already running, also while it waits for a lock, takt says so and starts nothing. Needs `--allow-writes`. |
 | `takt web [--bind A] [--port N] [--allow-writes]` | Serves the dashboard on the Tailscale address of this device. `install` runs it as a service on the devices in `settings.web`. See [web.md](web.md). |
+| `takt report` | Sends the job rows of this device to the web devices now. Each run of a job also sends them. |
 | `takt enable <id>` | Arms the schedule of an installed job. Needs `--allow-writes`. |
 | `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
 
