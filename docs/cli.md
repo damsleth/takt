@@ -70,7 +70,7 @@ On a device named in `[settings] web`, `install` also installs and starts the we
 |---|---|
 | `takt --host <h> <command>` | Runs the command on host `h` over ssh. `--host` must be the first argument. |
 | `takt --host <h> push` | Copies `takt.py` and `jobs.<h>.toml` to the host. Needs `--allow-writes`. |
-| `takt --host <h> install` | Pushes, then installs on the host. Needs `--allow-writes`. |
+| `takt --host <h> install` | Pushes, then installs on the host. Needs `--allow-writes`. Without it, nothing is pushed, so the host plans from its current jobs file. If `jobs.<h>.toml` declares other jobs, a `NOTE` names the jobs that the push adds and drops. |
 
 See [hosts.md](hosts.md).
 
