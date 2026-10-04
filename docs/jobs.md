@@ -83,7 +83,7 @@ Schedules use the clock of the host that runs the job.
 | `exe:<name>` | `<name>` is on `PATH`. |
 | `fda` | This process can read `~/Library/Messages/chat.db`. This tests macOS Full Disk Access. If it fails, the message names the binary that needs the grant. |
 | `fda:<path>` | This process can read `<path>`. |
-| `owa:<profile>` | [owa-piggy](https://github.com/damsleth/owa-piggy) reports a valid token for the profile. |
+| `owa:<profile>` | [owa-piggy](https://github.com/damsleth/owa-piggy) reports a valid token for the profile, and its reseed does not need a sign-in (`reseed.state` from `owa-piggy status --json`). An older owa-piggy without `--json` is checked on token expiry only. |
 
 `takt preflight` runs all checks now.
 

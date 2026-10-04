@@ -386,10 +386,31 @@ def parse_owa_status(text):
     return out
 
 
+def parse_owa_json(text):
+    """`owa-piggy status --json` -> {profile: {"ok": token valid, "reseed": state or None,
+    "fails": n, "max": n, "minutes": refresh-token minutes left}}. None if it is not that JSON."""
+    try:
+        profiles = json.loads(text)["profiles"]
+        out = {}
+        for p in profiles:
+            rs, rt = p.get("reseed") or {}, p.get("refresh_token") or {}
+            out[p["profile"]] = {"ok": p.get("state") == "ok", "reseed": rs.get("state"), "fails": rs.get("fails"),
+                                 "max": rs.get("max_fails"), "minutes": rt.get("minutes_remaining")}
+        return out
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 def owa_status():
+    """Reseed health from `owa-piggy status --json` (owa-piggy with reseed health), else the
+    token expiry from the text status of an older owa-piggy."""
     cmd = os.environ.get("TAKT_OWA_PIGGY", "owa-piggy")
     try:
-        r = subprocess.run([cmd, "status"], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([cmd, "status", "--json"], capture_output=True, text=True, timeout=60)
+        js = parse_owa_json(r.stdout)
+        if js is not None:
+            return {"json": js}
+        r = subprocess.run([cmd, "status"], capture_output=True, text=True, timeout=60)
         return parse_owa_status(r.stdout)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -417,6 +438,17 @@ def check_need(need, cache):
         st = cache["owa"]
         if st is None:
             return False, "owa-piggy status unavailable"
+        if "json" in st:  # reseed health: a token can look valid while its reseed needs a sign-in
+            p = st["json"].get(arg)
+            if p is None:
+                return False, f"profile {arg} unknown"
+            if not p["ok"]:
+                return False, f"needs sign-in: no valid token for {arg} (owa-piggy setup --profile {arg})"
+            if p["reseed"] in ("needs_signin", "backed_off"):
+                return False, (f"needs sign-in: reseed {p['reseed'].replace('_', ' ')} ({p['fails']}/{p['max']}) "
+                               f"for {arg} (owa-piggy setup --profile {arg})")
+            left = f"token valid for {p['minutes']} min" if p["minutes"] is not None else "token valid"
+            return True, left + ("" if p["reseed"] == "ok" else f", reseed {p['reseed'] or 'not reported'}")
         p = st.get(arg)
         if p is None or p["disabled"]:
             return False, f"profile {arg} unknown or disabled"
@@ -1742,6 +1774,7 @@ def self_check():
         check_review8(ok, tmp)
         check_review9(ok, tmp)
         check_review10(ok, tmp)
+        check_owa_reseed(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -2744,6 +2777,38 @@ def check_review10(ok, tmp):
         ok(False, "spec: job ids that differ only by case are rejected")
     except ValueError:
         ok(True, "")
+
+
+def check_owa_reseed(ok, tmp):
+    """owa:<profile> reads reseed health: a valid token whose reseed needs a sign-in is not healthy."""
+    data = {"profiles": [
+        {"profile": "good", "state": "ok", "refresh_token": {"minutes_remaining": 1400},
+         "reseed": {"state": "ok", "fails": 0, "max_fails": 3}},
+        {"profile": "tired", "state": "ok", "refresh_token": {"minutes_remaining": 1380},
+         "reseed": {"state": "needs_signin", "fails": 2, "max_fails": 3}},
+        {"profile": "gone", "state": "ok", "refresh_token": {"minutes_remaining": 1380},
+         "reseed": {"state": "backed_off", "fails": 3, "max_fails": 3}},
+        {"profile": "dead", "state": "no valid token", "refresh_token": {}, "reseed": {"state": "ok"}},
+        {"profile": "google", "state": "ok", "refresh_token": {"minutes_remaining": None}, "reseed": {"state": "unknown"}}]}
+    cache = {"owa": {"json": parse_owa_json(json.dumps(data))}}
+    r = {n: check_need(f"owa:{n}", cache) for n in ("good", "tired", "gone", "dead", "google", "ghost")}
+    ok(r["good"][0] and "1400 min" in r["good"][1], "owa: a healthy profile passes with its token time")
+    ok(not r["tired"][0] and "reseed needs signin (2/3)" in r["tired"][1] and not r["gone"][0] and "backed off (3/3)" in r["gone"][1],
+       "owa: a valid token whose reseed needs a sign-in or backed off fails (the dno case)")
+    ok(not r["dead"][0] and r["google"][0] and "reseed unknown" in r["google"][1] and not r["ghost"][0],
+       "owa: no token fails, unknown reseed passes with a note, an unknown profile fails")
+    ok(parse_owa_json("profile: x\nauthtoken: expires 2026-01-01T00:00:00Z\n") is None,
+       "owa: text status is not taken for JSON (older owa-piggy falls back)")
+    if os.name != "nt":  # the fake owa-piggy is a sh script that answers --json
+        fake = tmp / "owa-piggy-json"
+        fake.write_text("#!/bin/sh\n[ \"$2\" = --json ] && cat <<'E'\n" + json.dumps(data) + "\nE\n")
+        fake.chmod(0o755)
+        os.environ["TAKT_OWA_PIGGY"] = str(fake)
+        try:
+            st = owa_status()
+        finally:
+            os.environ.pop("TAKT_OWA_PIGGY")
+        ok(st and set(st["json"]) == {"good", "tired", "gone", "dead", "google"}, "owa: status --json is read from owa-piggy")
 
 
 def check_windows_last(ok):
