@@ -224,8 +224,12 @@ def normalize(jid, j) -> dict:
     return job
 
 
+def read_toml(path) -> dict:
+    return tomllib.loads(Path(path).read_text(encoding="utf-8"))  # TOML is UTF-8; a Windows locale default is not
+
+
 def load_spec(path) -> dict:
-    raw = tomllib.loads(Path(path).read_text())
+    raw = read_toml(path)
     spec = {jid: normalize(jid, j) for jid, j in raw.get("job", {}).items()}
     if len({j.lower() for j in spec}) != len(spec):  # records, markers and units would share a file
         raise ValueError("two job ids differ only by case: " + ", ".join(sorted(spec)))
@@ -645,9 +649,10 @@ BEFORE_UNLOCK = [end_job_leftovers]  # run while the locks are still held
 
 
 def pulled_for(state: Path, jid, slot):
-    """The job already ran for this slot, pulled in by another job."""
+    """The job already ran for this slot or a later one, pulled in by another job: a run for an
+    older slot that waited on the lock would overwrite the newer record."""
     last = read_record(state, jid)
-    return bool(last and last.get("pulled_by") and last.get("slot") == slot.isoformat()) and last
+    return bool(last and last.get("pulled_by") and (last.get("slot") or "") >= slot.isoformat()) and last
 
 
 START_TTL = 600  # seconds a `takt start` request waits for the scheduler to run the job
@@ -830,6 +835,8 @@ def parse_launchd(data: bytes) -> dict:
     p = plistlib.loads(data)
     label = p["Label"]
     pa = p.get("ProgramArguments") or ["/bin/sh", "-c", p.get("Program", "")]
+    if p.get("Program") and p.get("ProgramArguments"):  # Program runs; ProgramArguments[0] is only argv[0]
+        pa = [p["Program"], *pa[1:]]
     # reverse-DNS label: drop the two owner parts (com.example.backup.daily -> backup-daily)
     parts = label.split(".")
     jid = re.sub(r"[^A-Za-z0-9_-]", "-", ".".join(parts[2:]) if len(parts) > 2 else label)
@@ -846,7 +853,7 @@ def parse_launchd(data: bytes) -> dict:
         if any(set(d) != set(dicts[0]) for d in dicts):
             raise ValueError("calendar dicts with differing keys do not map to one cron line")
         sets = {k: v for k, v in sets.items() if v}
-        if len(dicts) != len(list(product(*sets.values()))):
+        if len({tuple(sorted(d.items())) for d in dicts}) != len(list(product(*sets.values()))):
             raise ValueError("calendar dicts are not a cartesian product; cannot map to one cron line")
         f = [sets.get("Minute"), sets.get("Hour"), sets.get("Day"), sets.get("Month"),
              sorted({v % 7 for v in sets["Weekday"]}) if "Weekday" in sets else None]
@@ -1021,6 +1028,8 @@ def split_steps(cmd):
         raise ValueError("shell expansion")
     if re.search(r"(^|\s)(['\"]2['\"]\s*|2\s+)>>", cmd):  # `echo 2 >> f`, `echo "2">> f`: the 2 is an argument
         raise ValueError("ambiguous 2 before >>")
+    if any(fd != "2" for fd in re.findall(r"(?:^|\s)(\d+)>>", cmd)):  # `echo hi 1>> f`: the 1 is a descriptor
+        raise ValueError("descriptor before >>")
     if re.search(r"['\"][;<>|&]|[;<>|&]['\"]", cmd):  # `echo ";"`: shlex drops the quotes that made it an argument
         raise ValueError("quote next to an operator")
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
@@ -1503,6 +1512,14 @@ def format_record(jid, r):
     return "\n".join(out)
 
 
+def tail(p, n=8, cap=65536):
+    """The last n lines of a file, from its last `cap` bytes: logs only grow."""
+    with open(p, "rb") as f:
+        start = f.seek(max(0, f.seek(0, 2) - cap))
+        lines = f.read().decode(errors="replace").splitlines()
+    return (lines[1:] if start else lines)[-n:]  # from mid-file, the first line is a fragment
+
+
 def show(spec, state, jid):
     """Last record of one job and the tail of its logs: the TUI preview."""
     if jid not in spec:
@@ -1514,7 +1531,7 @@ def show(spec, state, jid):
     for p in dict.fromkeys(logs):
         if p.is_file():
             print(f"\n== {p}")
-            print("\n".join(p.read_text(errors="replace").splitlines()[-8:]))
+            print("\n".join(tail(p)))
     return 0
 
 
@@ -1536,7 +1553,7 @@ def host_settings(host):
     p = CONFIG / f"jobs.{host}.toml"
     if not p.exists():
         sys.exit(f"no spec for host {host!r}: create {p}")
-    return tomllib.loads(p.read_text()).get("settings", {})
+    return read_toml(p).get("settings", {})
 
 
 def remote_argv(host, args, cfg=None):
@@ -1546,7 +1563,7 @@ def remote_argv(host, args, cfg=None):
         raise ValueError(f"not an ssh alias: {host!r}")
     cfg = host_settings(host) if cfg is None else cfg
     cmd = [cfg.get("python", "python3"), cfg.get("script", f"{REMOTE_DIR}/takt.py"), *args]
-    bad = [x for x in cmd if not SAFE_ARG.fullmatch(x)]
+    bad = [x for x in cmd if not SAFE_ARG.fullmatch(x)] + [x for x in args if "\\" in x]  # sh: `\--x` is `--x`
     if bad:
         raise ValueError(f"not forwardable over ssh: {bad}")
     return ["ssh", host, " ".join(cmd)]
@@ -1561,7 +1578,7 @@ def push(host):
         (Path(t) / ".config/takt").mkdir(parents=True)
         shutil.copy(Path(__file__).resolve(), Path(t) / REMOTE_DIR / "takt.py")
         shutil.copy(CONFIG / f"jobs.{host}.toml", Path(t) / ".config/takt/jobs.toml")
-        (Path(t) / ".config/takt/net.toml").write_text(net_toml(host, net_settings()))
+        (Path(t) / ".config/takt/net.toml").write_text(net_toml(host, net_settings()), encoding="utf-8")
         return subprocess.run(["scp", "-q", "-r", str(Path(t) / ".local"), str(Path(t) / ".config"),
                                f"{host}:"]).returncode
 
@@ -1569,7 +1586,7 @@ def push(host):
 def stale_plan_note(host):
     """A dry-run `--host H install` pushes nothing, so H plans from its current jobs.toml. When the
     local jobs.<host>.toml declares other jobs, say so: that plan is not what --allow-writes installs."""
-    local = set(tomllib.loads((CONFIG / f"jobs.{host}.toml").read_text()).get("job", {}))
+    local = set(read_toml(CONFIG / f"jobs.{host}.toml").get("job", {}))
     remote = {r["id"] for r in remote_rows(host) if r.get("id") not in (None, "-")}
     if local == remote:
         return None
@@ -1618,10 +1635,10 @@ def net_settings():
     net of one and its own master."""
     f = CONFIG / "net.toml"
     if f.exists():
-        net = tomllib.loads(f.read_text())
+        net = read_toml(f)
     else:
         jt = CONFIG / "jobs.toml"
-        cfg = tomllib.loads(jt.read_text()).get("settings", {}) if jt.exists() else {}
+        cfg = read_toml(jt).get("settings", {}) if jt.exists() else {}
         me = cfg.get("name") or self_name()
         net = {"status": cfg.get("status", "master"), "master": cfg.get("master", me), "self": me,
                "hosts": {h: {"python": host_settings(h).get("python", "python3")} for h in hosts()[1:]},
@@ -2278,7 +2295,7 @@ def init_spec(path: Path):
     if path.exists():
         sys.exit(f"{path} exists. Edit it, or remove it first.")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(starter_spec())
+    path.write_text(starter_spec(), encoding="utf-8")
     print(f"wrote {path}\nnext: takt install (shows the plan), then takt install --allow-writes")
     return 0
 
@@ -2286,7 +2303,7 @@ def init_spec(path: Path):
 def make_ctx(a):
     """Render context. `[settings] path/python` pin what the scheduler gets; a captured shell PATH
     can carry throwaway entries (fnm multishells), so the spec should pin it."""
-    cfg = tomllib.loads(Path(a.spec).read_text()).get("settings", {})
+    cfg = read_toml(a.spec).get("settings", {})
     return {"python": cfg.get("python") or os.path.realpath(sys.executable),
             "script": str(Path(__file__).resolve()), "spec": str(Path(a.spec).resolve()),
             "path": cfg.get("path") or os.environ.get("PATH", DEFAULT_PATH), "state": str(state_dir(a))}
@@ -2465,7 +2482,7 @@ def main(argv=None):
         print(toml_job(parse_launchd(Path(a.file).expanduser().read_bytes())))
         return 0
     if a.cmd == "import-cron":
-        text = Path(a.file).read_text() if a.file else subprocess.run(
+        text = Path(a.file).read_text(encoding="utf-8") if a.file else subprocess.run(
             ["crontab", "-l"], capture_output=True, text=True).stdout
         jobs, skipped, warns = import_cron(text)
         for w in warns:
@@ -2549,6 +2566,7 @@ def self_check():
         check_web_reports(ok, tmp)
         check_pub_review1(ok, tmp)
         check_pub_review2(ok, tmp)
+        check_pub_review3(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -4150,6 +4168,45 @@ def check_pub_review2(ok, tmp):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def check_pub_review3(ok, tmp):
+    """Regressions for the third review of the public repo (2026-10-05)."""
+    st = tmp / "pr3-st"
+    st.mkdir()
+    write_record(st, {"id": "a", "slot": "2026-10-04T15:00:00", "pulled_by": "b", "status": "ok", "steps": []})
+    ok(pulled_for(st, "a", datetime(2026, 10, 4, 14)) and pulled_for(st, "a", datetime(2026, 10, 4, 15))
+       and not pulled_for(st, "a", datetime(2026, 10, 4, 16)),
+       "run: a queued run for an older slot is obsolete after a pull-in recorded a newer one")
+    try:
+        remote_argv("kvps", ["start", "\\--allow-writes"], cfg={})
+        ok(False, "remote: a backslash in a forwarded argument is refused")
+    except ValueError:
+        ok(True, "")
+    ok(remote_argv("kwin", ["status"], cfg={"python": "C:\\Py\\python.exe"})[-1].startswith("C:\\Py"),
+       "remote: the python setting may still be a Windows path")
+    for line in ("/bin/echo hello 1>> log", "/bin/echo hello 3>> log"):
+        try:
+            split_steps(line)
+            ok(False, f"import-cron: {line!r} stays a shell line")
+        except ValueError:
+            ok(True, "")
+    ok(split_steps("/bin/echo hello 2>> err") == [(["/bin/echo", "hello"], None, "err")], "import-cron: 2>> still splits")
+    pl = plistlib.dumps({"Label": "com.x.y.z", "Program": "/bin/echo", "ProgramArguments": ["custom-argv0", "hello"]})
+    ok(parse_launchd(pl)["steps"][0]["command"] == ["/bin/echo", "hello"], "import-plist: Program is the executable")
+    cal = [{"Hour": 1, "Minute": 0}, {"Hour": 1, "Minute": 0}, {"Hour": 2, "Minute": 0}, {"Hour": 2, "Minute": 30}]
+    try:
+        parse_launchd(plistlib.dumps({"Label": "com.x.y.z", "ProgramArguments": ["/bin/true"], "StartCalendarInterval": cal}))
+        ok(False, "import-plist: duplicate calendar dicts cannot hide a missing combination")
+    except ValueError:
+        ok(True, "")
+    big = tmp / "pr3-big.log"
+    big.write_text("x" * 200_000 + "\n" + "".join(f"line {i}\n" for i in range(20)))
+    ok(tail(big) == [f"line {i}" for i in range(12, 20)] and tail(big, cap=30) == ["line 17", "line 18", "line 19"],
+       "show: the log tail comes from the end of the file")
+    t = tmp / "pr3-utf8.toml"
+    t.write_bytes('[job.u]\ncommand = ["echo", "J\u00f8rgen"]\n'.encode("utf-8"))
+    ok(load_spec(t)["u"]["steps"][0]["command"][1] == "J\u00f8rgen", "spec: a jobs file is read as UTF-8")
 
 
 def check_plans_apply(ok, tmp):

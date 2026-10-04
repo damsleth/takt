@@ -33,7 +33,7 @@ Only `push` and `install` copy files. Other commands run the copy that is on the
 
 The host name must be an ssh alias: letters, digits and `. _ @ -`, with no `-` at the start.
 
-The login shell on the host can be `sh` or PowerShell, and ssh joins arguments with spaces. So takt sends no quotes. Every argument after `--host <host>` must be a plain word: letters, digits and `. / : \ = , @ + - _`. takt refuses other arguments before it starts ssh.
+The login shell on the host can be `sh` or PowerShell, and ssh joins arguments with spaces. So takt sends no quotes. Every argument after `--host <host>` must be a plain word: letters, digits and `. / : = , @ + - _`. takt refuses other arguments before it starts ssh. A backslash is refused because `sh` reads it as an escape. Write Windows paths with `/`. Only the `python` and `script` settings of a host can contain `\`.
 
 ## Web dashboard on a host
 
