@@ -16,6 +16,7 @@ that spec to the host over ssh and runs the command there.
     takt install [--allow-writes]              plan, then register with the scheduler
     takt start|enable|disable <id>             through the native scheduler (--allow-writes)
     takt --host myvps install --allow-writes   the same, on another host
+    takt web [--allow-writes]                  dashboard on the tailnet (install runs it where settings.web says)
     takt --check                               offline self-test, no auth, no network
 
 Docs: https://github.com/damsleth/takt/tree/main/docs
@@ -23,6 +24,7 @@ Docs: https://github.com/damsleth/takt/tree/main/docs
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import plistlib
@@ -33,13 +35,16 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import product
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 try:
     import fcntl
@@ -1254,19 +1259,24 @@ def installed_from(be, agents_dir: Path, jid, spec_path):
     return str(spec_path) in text
 
 
-def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab="", loaded=None, owned=None):
+def plan_admin(cmd, spec, be, agents_dir: Path, known, nat, ids=None, ctx=None, crontab="", loaded=None, owned=None,
+               web=None):
     """install: retire the jobs of this jobs file that it no longer names, then install the file.
     uninstall: the given ids, or every job in the file and every job installed from it.
     `owned`: the registered ids installed from this jobs file (installed_from). A job from another
-    file is never retired or removed implicitly."""
+    file is never retired or removed implicitly.
+    `web`: None leaves the web service alone; a command list installs it (install only); False
+    retires it (install on a device that is not a web host, and uninstall without ids)."""
     owned = known if owned is None else owned
     if cmd == "install":
         stale = [i for i in owned if i not in spec]
         if loaded is not None:  # retired below: a `replaces` naming one of them must not boot it out again
             loaded = loaded - {f"{PREFIX}.{i}" for i in stale}
         return (plan_uninstall(stale, agents_dir, be, nat)
-                + plan_install(spec, ctx, agents_dir, crontab, be, loaded))
-    return plan_uninstall(list(ids or sorted(set(spec) | set(owned))), agents_dir, be, nat)
+                + plan_install(spec, ctx, agents_dir, crontab, be, loaded)
+                + (plan_web(be, ctx, agents_dir, web or None, loaded) if web is not None else []))
+    return (plan_uninstall(list(ids or sorted(set(spec) | set(owned))), agents_dir, be, nat)
+            + (plan_web(be, ctx, agents_dir, None, loaded) if web is not None and not ids else []))
 
 
 def describe(act):
@@ -1562,7 +1572,8 @@ def net_settings():
         me = cfg.get("name") or self_name()
         net = {"status": cfg.get("status", "master"), "master": cfg.get("master", me), "self": me,
                "hosts": {h: {"python": host_settings(h).get("python", "python3")} for h in hosts()[1:]},
-               "python": cfg.get("python") or (sys.executable if os.name == "nt" else shutil.which("python3") or sys.executable)}
+               "python": cfg.get("python") or (sys.executable if os.name == "nt" else shutil.which("python3") or sys.executable),
+               **{k: cfg[k] for k in ("web", "web_port", "web_writes", "web_bind") if k in cfg}}
     net.setdefault("self", self_name())
     net.setdefault("status", "master")
     net.setdefault("master", net["self"])
@@ -1571,6 +1582,7 @@ def net_settings():
         raise ValueError(f"settings.status {net['status']!r}: use one of {', '.join(STATUS_MODES)}")
     if net["master"] == "local":
         net["master"] = net["self"]
+    net.update(web_settings(net, net["self"]))
     return net
 
 
@@ -1597,18 +1609,22 @@ def net_toml(host, net):
     members = {h: c for h, c in net["hosts"].items() if h != host}
     members[net["self"]] = {"python": net.get("python") or "python3", "script": str(Path(__file__).resolve())}
     out = [f"# written by `takt --host {host} push` from {net['self']}; edit the controller's jobs.toml instead",
-           f"status = {toml_val(net['status'])}", f"master = {toml_val(net['master'])}", f"self = {toml_val(host)}", ""]
+           f"status = {toml_val(net['status'])}", f"master = {toml_val(net['master'])}", f"self = {toml_val(host)}",
+           f"web = {toml_val(net['web'])}", f"web_port = {net['web_port']}", f"web_writes = {toml_val(net['web_writes'])}", ""]
+    if net["web_bind"]:
+        out += ["[web_bind]"] + [f"{toml_val(k)} = {toml_val(v)}" for k, v in sorted(net["web_bind"].items())] + [""]
     for name, c in sorted(members.items()):
         out.append(f"[hosts.{toml_val(name)}]")
         out += [f"{k} = {toml_val(v)}" for k, v in sorted(c.items())] + [""]
     return "\n".join(out)
 
 
-def remote_rows(host, cfg=None):
+def remote_rows(host, cfg=None, timeout=60, opts=()):
     down = lambda why: [{"host": host, "id": "-", "sched": "-", "status": "unreachable", "last": None,
                          "next": None, "detail": why}]
     try:
-        r = subprocess.run(remote_argv(host, STATUS_PULL, cfg), capture_output=True, text=True, timeout=60)
+        argv = remote_argv(host, STATUS_PULL, cfg)
+        r = subprocess.run(argv[:1] + list(opts) + argv[1:], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
         return down(str(e))
     try:
@@ -1649,6 +1665,379 @@ def ui(allow_writes):
     return 0 if r.returncode in (0, 1, 130) else r.returncode
 
 
+# ------------------------------------------------------------------------- web
+# `takt web`: a dashboard over the same rows as `status -A`, served to the tailnet. Settings:
+# `web` (device names), `web_port`, `web_bind` (name -> address), `web_writes`. The service that
+# keeps it running is NOT a job: its names (dev.takt-web, takt.web.service, \takt-web\serve) lie
+# outside the job id rules, so a job named `web` cannot collide and uninstall treats it apart.
+
+WEB_PORT = 8787
+WEB_LABEL, WEB_UNIT, WEB_TASK = "dev.takt-web", "takt.web", "\\takt-web\\serve"
+TAILSCALE_BINS = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", r"C:\Program Files\Tailscale\tailscale.exe"]
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]  # no prompt can hang the page
+WEB_VERBS = ("start", "enable", "disable")
+
+
+def web_settings(cfg, me):
+    """Validate the web keys of a settings table -> {web, web_port, web_writes, web_bind}."""
+    names = cfg.get("web", [])
+    if not isinstance(names, list) or not all(isinstance(n, str) and (n == "local" or HOST_RE.fullmatch(n)) for n in names):
+        raise ValueError("settings.web: a list of device names, for example [\"myvps\"]")
+    port = cfg.get("web_port", WEB_PORT)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"settings.web_port {port!r}: use a number from 1 to 65535")
+    binds = cfg.get("web_bind", {})
+    if not isinstance(binds, dict):
+        raise ValueError("settings.web_bind: a table of device name = address")
+    for k, v in binds.items():
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            raise ValueError(f"settings.web_bind.{k} {v!r}: use an IP address") from None
+    return {"web": [me if n == "local" else n for n in names], "web_port": port,
+            "web_writes": bool(cfg.get("web_writes", False)), "web_bind": dict(binds)}
+
+
+def web_scope(net):
+    """A web host is a viewer: it shows every device, whatever settings.status says (master, all,
+    client). Only `none` turns the page off. This does not change `takt status -A` on that host."""
+    return "off" if net["status"] == "none" else "net"
+
+
+def tailscale_ip(run=subprocess.run, which=shutil.which, isfile=os.path.isfile):
+    """This machine's Tailscale IPv4 address, or None. Tries the CLI on PATH, then the app paths."""
+    for c in [which("tailscale"), *TAILSCALE_BINS]:
+        if not c or not isfile(c):
+            continue
+        try:
+            out = run([c, "ip", "-4"], capture_output=True, text=True, timeout=10, **NO_WINDOW).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.split():
+            try:
+                if ipaddress.ip_address(line).version == 4:
+                    return line
+            except ValueError:
+                pass
+    return None
+
+
+def web_bind_addr(arg, net, finder=tailscale_ip):
+    """--bind, else settings.web_bind for this device, else the Tailscale address. Never a wildcard
+    by default: with none of these, the server refuses to start."""
+    addr = arg or net["web_bind"].get(net["self"]) or finder()
+    if not addr:
+        sys.exit("takt web: no Tailscale address (is tailscale up?). Set --bind, or [settings.web_bind] "
+                 f"{net['self']} = \"<address>\" in the jobs file.")
+    try:
+        ipaddress.ip_address(addr)
+    except ValueError:
+        sys.exit(f"takt web: bad address {addr!r}")
+    return addr
+
+
+def host_ok(header):
+    """DNS rebinding guard: a Host header must be an IP address, localhost, a bare name or a
+    MagicDNS name (.ts.net). A page on another domain that resolves to this address fails."""
+    h = (header or "").strip().lower()
+    h = h[1:h.index("]")] if h.startswith("[") and "]" in h else h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        return bool(h) and ("." not in h or h.endswith(".ts.net") or h == "localhost")
+
+
+class WebApp:
+    """What the page shows and does. Every outside effect goes through `run`, `remote` and
+    `local_rows`, so the check can swap them."""
+
+    def __init__(self, net, spec, state, writes, run=None, remote=None, local_rows=None, ttl=8):
+        self.net, self.spec, self.state, self.writes, self.ttl = net, spec, Path(state), writes, ttl
+        self.run_ = run or self._run
+        self.remote = remote or (lambda h, c: remote_rows(h, c, timeout=20, opts=SSH_OPTS))
+        self.local_rows = local_rows or self._local_rows
+        self.lock, self.cache, self.quiet = threading.Lock(), (0.0, None), False
+
+    def _local_rows(self):
+        spec = load_spec(self.spec) if Path(self.spec).exists() else {}
+        be = backend()
+        return status_rows(spec, self.state, native_states(spec, be, default_dir(be, self.state)))
+
+    @staticmethod
+    def _run(argv):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, **NO_WINDOW)
+        except (OSError, subprocess.SubprocessError) as e:
+            return 1, str(e)
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    def rows(self):
+        """Local rows plus every peer's, in parallel; an unreachable peer is one row, never an error.
+        Cached for `ttl` seconds, so open pages share one fan-out."""
+        with self.lock:
+            at, data = self.cache
+            if data is None or time.monotonic() - at > self.ttl:
+                data = self.collect()
+                self.cache = (time.monotonic(), data)
+            return data
+
+    def collect(self):
+        me = self.net["self"]
+        if web_scope(self.net) == "off":
+            return {"rows": [], "note": "status display is off (settings.status = none)"}
+        try:
+            rows = self.local_rows()
+        except Exception as e:  # a broken jobs file must show, not kill the page
+            rows = [{"id": "-", "sched": "-", "status": "error", "last": None, "next": None, "detail": str(e)}]
+        for r in rows:
+            r["host"] = me
+        peers = [(h, c) for h, c in self.net["hosts"].items() if h != me]
+        with ThreadPoolExecutor() as ex:
+            rows += [x for rs in ex.map(lambda hc: self.remote(*hc), peers) for x in rs]
+        for r in rows:
+            r.pop("record", None)
+        return {"rows": rows, "note": None}
+
+    def argv(self, host, args):
+        """The command for `host`: this script for the local device, ssh for a peer. None if unknown."""
+        if host == self.net["self"]:
+            return [sys.executable, str(Path(__file__).resolve()), *args, "--spec", str(self.spec), "--state", str(self.state)]
+        if host in self.net["hosts"]:
+            a = remote_argv(host, args, self.net["hosts"][host])
+            return a[:1] + SSH_OPTS + a[1:]
+        return None
+
+    def job_call(self, host, jid, args):
+        if not ID_RE.fullmatch(jid or ""):
+            return 400, "bad job id"
+        argv = self.argv(host, args)
+        if argv is None:
+            return 400, "unknown device"
+        code, text = self.run_(argv)
+        return (200 if code == 0 else 502), text
+
+    def show(self, host, jid):
+        return self.job_call(host, jid, ["show", jid])
+
+    def act(self, host, jid, verb):
+        if not self.writes:
+            return 403, "read-only: start the server with --allow-writes"
+        if verb not in WEB_VERBS:
+            return 400, "bad action"
+        self.cache = (0.0, None)  # the next refresh shows the effect
+        return self.job_call(host, jid, [verb, jid, "--allow-writes"])
+
+
+def web_handler(app):
+    class H(BaseHTTPRequestHandler):
+        server_version = "takt"
+
+        def log_message(self, fmt, *args):
+            if app.quiet:
+                return
+            print(f"{self.address_string()} {fmt % args}", file=sys.stderr, flush=True)
+
+        def send(self, code, body, ctype="text/plain; charset=utf-8"):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; "
+                             "style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def json(self, code, obj):
+            self.send(code, json.dumps(obj), "application/json")
+
+        def do_GET(self):
+            if not host_ok(self.headers.get("Host")):
+                return self.send(403, "bad Host header")
+            u = urlsplit(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            if u.path == "/":
+                return self.send(200, WEB_HTML, "text/html; charset=utf-8")
+            if u.path == "/api/status":
+                return self.json(200, {**app.rows(), "self": app.net["self"], "writes": app.writes,
+                                       "generated": datetime.now().isoformat(timespec="seconds")})
+            if u.path == "/api/show":
+                code, text = app.show(q.get("host", ""), q.get("id", ""))
+                return self.send(code, text)
+            self.send(404, "not found")
+
+        def do_POST(self):
+            if not host_ok(self.headers.get("Host")):
+                return self.send(403, "bad Host header")
+            # CSRF: a custom header cannot be sent cross-origin without a preflight, which this
+            # server never answers; Origin, when sent, must be this server.
+            origin = self.headers.get("Origin")
+            if self.headers.get("X-Takt") != "1" or (origin and urlsplit(origin).netloc != self.headers.get("Host")):
+                return self.send(403, "missing X-Takt header or foreign Origin")
+            if urlsplit(self.path).path != "/api/act":
+                return self.send(404, "not found")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(min(n, 4096)) or b"{}")
+                host, jid, verb = str(req["host"]), str(req["id"]), str(req["verb"])
+            except (ValueError, KeyError, TypeError):
+                return self.send(400, "bad request")
+            code, text = app.act(host, jid, verb)
+            self.send(code, text)
+    return H
+
+
+def web_main(a):
+    net = net_settings()
+    port = a.port if a.port is not None else net["web_port"]
+    addr = web_bind_addr(a.bind, net)
+    if ipaddress.ip_address(addr).is_unspecified:
+        print("takt web: warning: this address listens on every interface, not only the tailnet", file=sys.stderr)
+    app = WebApp(net, a.spec, state_dir(a), a.allow_writes)
+    srv = ThreadingHTTPServer((addr, port), web_handler(app))
+    srv.daemon_threads = True
+    shown = f"[{addr}]" if ":" in addr else addr
+    print(f"takt web on http://{shown}:{srv.server_address[1]}/  "
+          f"({'writes ON' if a.allow_writes else 'read-only'}; this device: {net['self']})", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# The service. Install writes it on a web host; install on a device that left `web`, and
+# uninstall with no ids, remove it.
+
+def web_service_argv(ctx, net):
+    """The command the service runs, or None when this device is not a web host."""
+    if net["self"] not in net["web"]:
+        return None
+    argv = [ctx["python"], ctx["script"], "web", "--spec", ctx["spec"], "--state", ctx["state"], "--port", str(net["web_port"])]
+    if net["web_bind"].get(net["self"]):
+        argv += ["--bind", net["web_bind"][net["self"]]]
+    return argv + (["--allow-writes"] if net["web_writes"] else [])
+
+
+def web_file(be, agents_dir: Path) -> Path:
+    return agents_dir / {"launchd": f"{WEB_LABEL}.plist", "systemd": f"{WEB_UNIT}.service"}.get(be, f"{WEB_UNIT}.xml")
+
+
+def render_web_launchd(argv, ctx) -> bytes:
+    d = {"Label": WEB_LABEL, "ProgramArguments": argv, "EnvironmentVariables": {"PATH": ctx["path"]},
+         "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10, "ProcessType": "Background",
+         "StandardOutPath": f"{ctx['state']}/log/web.log", "StandardErrorPath": f"{ctx['state']}/log/web.log"}
+    return plistlib.dumps(d, sort_keys=False)
+
+
+def render_web_systemd(argv, ctx) -> str:
+    return ("[Unit]\nDescription=takt web dashboard\nAfter=network-online.target\n\n[Service]\nType=simple\n"
+            f"Environment=PATH={ctx['path']}\nExecStart={' '.join(sd_quote(a) for a in argv)}\n"
+            "Restart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n")
+
+
+def render_web_schtasks(argv) -> str:
+    ET.register_namespace("", TS_NS)
+    root = ET.Element(f"{{{TS_NS}}}Task", version="1.2")
+    _sub(_sub(root, "RegistrationInfo"), "Description", "takt web dashboard")
+    _sub(_sub(_sub(root, "Triggers"), "LogonTrigger"), "Enabled", "true")
+    s = _sub(root, "Settings")
+    _sub(s, "MultipleInstancesPolicy", "IgnoreNew")
+    _sub(s, "DisallowStartIfOnBatteries", "false")
+    _sub(s, "StopIfGoingOnBatteries", "false")
+    _sub(s, "ExecutionTimeLimit", "PT0S")  # no limit: it is a server
+    r = _sub(s, "RestartOnFailure")
+    _sub(r, "Interval", "PT1M")
+    _sub(r, "Count", 999)
+    ex = _sub(_sub(root, "Actions"), "Exec")
+    _sub(ex, "Command", re.sub(r"python\.exe$", "pythonw.exe", argv[0], flags=re.I))
+    _sub(ex, "Arguments", " ".join(sd_quote(a) for a in argv[1:]))
+    ET.indent(root)
+    return ET.tostring(root, encoding="unicode") + "\n"
+
+
+def plan_web(be, ctx, agents_dir: Path, argv, loaded=None):
+    """Actions that install the web service (`argv` is its command) or retire it (`argv` falsy;
+    nothing if it is not there). `loaded` is the set of launchd labels, as for plan_install."""
+    f, acts, uid = web_file(be, agents_dir), [], _uid()
+    if be == "launchd":
+        t, here = f"gui/{uid}/{WEB_LABEL}", f.exists() or WEB_LABEL in (loaded or ())
+        if here:
+            acts.append(("run" if loaded is not None and WEB_LABEL in loaded else "try", ["launchctl", "bootout", t], None))
+        if argv:
+            acts += [("mkdir", Path(ctx["state"]) / "log", None), ("write", f, render_web_launchd(argv, ctx)),
+                     ("run", ["launchctl", "enable", t], None), ("run", ["launchctl", "bootstrap", f"gui/{uid}", str(f)], None)]
+        elif here:
+            acts.append(("rm", f, None))
+    elif be == "systemd":
+        u = f"{WEB_UNIT}.service"
+        if argv:
+            acts += [("write", f, render_web_systemd(argv, ctx)), ("run", ["systemctl", "--user", "daemon-reload"], None),
+                     ("run", ["systemctl", "--user", "enable", u], None), ("run", ["systemctl", "--user", "restart", u], None)]
+        elif f.exists():
+            acts += [("try", ["systemctl", "--user", "disable", "--now", u], None), ("rm", f, None),
+                     ("run", ["systemctl", "--user", "daemon-reload"], None)]
+    else:
+        if argv:
+            if f.exists():
+                acts.append(("try", ["schtasks", "/End", "/TN", WEB_TASK], None))
+            acts += [("write", f, render_web_schtasks(argv).encode("utf-16")),
+                     ("run", ["schtasks", "/Create", "/TN", WEB_TASK, "/XML", str(f), "/F"], None),
+                     ("run", ["schtasks", "/Run", "/TN", WEB_TASK], None)]
+        elif f.exists():
+            acts += [("try", ["schtasks", "/End", "/TN", WEB_TASK], None),
+                     ("try", ["schtasks", "/Delete", "/TN", WEB_TASK, "/F"], None), ("rm", f, None)]
+    return acts
+
+
+WEB_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>takt</title>
+<style>
+:root{--bg:#fff;--fg:#1c1f23;--mut:#6b7280;--line:#e5e7eb;--card:#f6f7f9;--ok:#15803d;--bad:#b91c1c;--warn:#b45309;--acc:#2563eb}
+@media(prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e6e8eb;--mut:#9aa1ab;--line:#2a2e35;--card:#1c1f25;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--acc:#60a5fa}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}
+h1{font-size:18px;margin:0}.mut{color:var(--mut)}main{padding:12px 16px}
+input[type=search]{padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+.tw{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}
+th,td{text-align:left;padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td.d{white-space:normal;color:var(--mut);max-width:40ch}tbody tr{cursor:pointer}tbody tr:hover,tr.sel{background:var(--card)}
+.ok{color:var(--ok)}.failed,.unreachable,.error,.lock-timeout{color:var(--bad)}.partial,.skipped{color:var(--warn)}.never{color:var(--mut)}
+pre{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;max-height:50vh;white-space:pre-wrap}
+button{padding:4px 12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button:hover{border-color:var(--acc)}#banner{color:var(--bad)}
+</style></head><body>
+<header><h1>takt</h1><span id="meta" class="mut"></span><input id="q" type="search" placeholder="filter">
+<label class="mut"><input id="auto" type="checkbox" checked> refresh every 15 s</label><button id="re">refresh</button><span id="banner"></span></header>
+<main><div class="tw"><table><thead><tr><th>HOST</th><th>ID</th><th>SCHED</th><th>STATUS</th><th>LAST</th><th>NEXT</th><th>DETAIL</th></tr></thead><tbody id="rows"></tbody></table></div>
+<h2 id="title" class="mut" style="font-size:15px">Select a job</h2><div id="acts"></div><span id="msg" class="mut"></span><pre id="show" hidden></pre></main>
+<script>
+const $=s=>document.querySelector(s);let data={rows:[],writes:false},sel=null,timer=null;
+const hm=s=>s?s.slice(5,16).replace('T',' '):'-';
+function td(t,c){const e=document.createElement('td');e.textContent=t;if(c)e.className=c;return e}
+function render(){const f=$('#q').value.toLowerCase(),tb=$('#rows');tb.textContent='';
+ for(const r of data.rows){const line=[r.host,r.id,r.sched,r.status,r.detail].join(' ').toLowerCase();if(f&&!line.includes(f))continue;
+  const tr=document.createElement('tr');if(sel&&sel.host===r.host&&sel.id===r.id)tr.className='sel';
+  tr.append(td(r.host),td(r.id),td(r.sched),td(r.status,r.status),td(hm(r.last)),td(hm(r.next)),td(r.detail||'','d'));
+  if(r.id!=='-')tr.onclick=()=>{sel={host:r.host,id:r.id};render();detail()};tb.append(tr)}
+ $('#meta').textContent=(data.note||('on '+data.self+' · '+(data.writes?'writes on':'read-only')+' · '+(data.generated||'')))}
+async function load(){try{const r=await fetch('/api/status');data=await r.json();$('#banner').textContent='';render();if(sel)detail()}
+ catch(e){$('#banner').textContent='cannot reach takt: '+e}}
+async function detail(){if(!sel)return;$('#title').textContent=sel.host+' / '+sel.id;const p=$('#show');p.hidden=false;
+ try{const r=await fetch('/api/show?host='+encodeURIComponent(sel.host)+'&id='+encodeURIComponent(sel.id));p.textContent=await r.text()}catch(e){p.textContent=String(e)}
+ const a=$('#acts');a.textContent='';if(data.writes)for(const v of ['start','enable','disable']){const b=document.createElement('button');b.textContent=v;b.onclick=()=>act(v);a.append(b,' ')}}
+async function act(v){$('#msg').textContent=v+'...';
+ try{const r=await fetch('/api/act',{method:'POST',headers:{'X-Takt':'1','Content-Type':'application/json'},body:JSON.stringify({host:sel.host,id:sel.id,verb:v})});
+  $('#msg').textContent=(await r.text()).split('\n').pop()}catch(e){$('#msg').textContent=String(e)}load()}
+function tick(){clearInterval(timer);if($('#auto').checked)timer=setInterval(load,15000)}
+$('#q').oninput=render;$('#re').onclick=load;$('#auto').onchange=tick;load();tick();
+</script></body></html>
+"""
+
+
 # ------------------------------------------------------------------------- CLI
 
 def starter_spec():
@@ -1661,6 +2050,8 @@ def starter_spec():
            "[settings]", f"python = {toml_val(py)}"]
     if os.name != "nt":
         out.append(f"path = {toml_val(str(Path.home() / '.local/bin') + ':' + DEFAULT_PATH)}")
+    out += ["", "# A web dashboard on one device of your tailnet (docs/web.md). Install starts it there:",
+            '# web = ["myvps"]']
     out += ["", "# Every 15 minutes, append a timestamp to a log. Replace it with a real job.",
             "[job.hello]", 'schedule = "*/15 * * * *"',
             f"command = {toml_val([py, '-c', 'import datetime; print(datetime.datetime.now().isoformat())'])}",
@@ -1731,6 +2122,10 @@ def build_parser():
     sub.add_parser("push", help="with --host H: copy takt.py and jobs.H.toml to H").add_argument(
         "--allow-writes", action="store_true")
     common(sub.add_parser("init", help="write a starter jobs.toml (never overwrites)"))
+    w = common(sub.add_parser("web", help="serve the dashboard to the tailnet (Tailscale address only)"))
+    w.add_argument("--port", type=int, help=f"default settings.web_port, else {WEB_PORT}")
+    w.add_argument("--bind", help="address to listen on (default: this device's Tailscale IPv4)")
+    w.add_argument("--allow-writes", action="store_true", help="show start/enable/disable buttons")
     return ap
 
 
@@ -1753,6 +2148,8 @@ def main(argv=None):
         sys.exit("push needs a host: takt --host <host> push --allow-writes")
     if a.cmd == "init":
         return init_spec(Path(a.spec))
+    if a.cmd == "web":
+        return web_main(a)
     if a.cmd == "run":
         spec = load_spec(a.spec)
         if a.id not in spec:
@@ -1852,10 +2249,11 @@ def main(argv=None):
             return 1
         try:
             spec_path = Path(a.spec).resolve()
-            acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None),
-                              ctx=make_ctx(a) if a.cmd == "install" else None,
+            ctx = make_ctx(a) if a.cmd == "install" else None
+            acts = plan_admin(a.cmd, spec, be, adir, known, nat, ids=getattr(a, "ids", None), ctx=ctx,
                               crontab=read_crontab(spec) if a.cmd == "install" else "", loaded=loaded,
-                              owned=[i for i in known if installed_from(be, adir, i, spec_path)])
+                              owned=[i for i in known if installed_from(be, adir, i, spec_path)],
+                              web=(web_service_argv(ctx, net_settings()) or False) if ctx else False)
         except ValueError as e:  # a job the scheduler cannot take: nothing has changed yet
             print(f"failed: {e}. Nothing changed.", file=sys.stderr)
             return 1
@@ -1912,6 +2310,7 @@ def self_check():
         check_status_scope(ok, tmp)
         check_windows_jobs(ok, tmp)
         check_owned(ok, tmp)
+        check_web(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -3078,6 +3477,192 @@ def check_owned(ok, tmp):
     ok(gone == [f"{PREFIX}.b.plist"], "install: retires only the stale jobs of its own jobs file")
     un = plan_admin("uninstall", {}, "launchd", la, ["a", "b"], nat, owned=owned)
     ok([Path(a).name for k, a, _ in un if k == "rm"] == [f"{PREFIX}.b.plist"], "uninstall: removes only its own jobs file's jobs")
+
+
+def check_web(ok, tmp):
+    """takt web: settings, scope, bind address, the service on each OS, retire, and a live server."""
+    import urllib.error
+    import urllib.request
+    g = globals()
+    saved = g["CONFIG"]
+    try:
+        cdir = tmp / "web-controller"
+        cdir.mkdir()
+        g["CONFIG"] = cdir
+        (cdir / "jobs.toml").write_text('[settings]\nname = "kmbp"\nweb = ["kvps", "local"]\nweb_port = 9100\n'
+                                        'web_writes = true\n\n[settings.web_bind]\nkvps = "100.68.171.58"\n')
+        (cdir / "jobs.kvps.toml").write_text("[settings]\n")
+        net = net_settings()
+        ok(net["web"] == ["kvps", "kmbp"] and net["web_port"] == 9100 and net["web_writes"] and net["web_bind"] == {"kvps": "100.68.171.58"},
+           "web: the controller reads web, web_port, web_writes and web_bind; local means this device")
+        (cdir / "jobs.toml").write_text('[settings]\nname = "kmbp"\n')
+        ok(net_settings()["web"] == [] and net_settings()["web_port"] == WEB_PORT and not net_settings()["web_writes"],
+           "web: with no settings there is no web host, the default port, and writes are off")
+        for bad in ('web = "kvps"', "web_port = 99999", 'web_bind = {kvps = "not-an-ip"}', "web = [\"a b\"]"):
+            (cdir / "jobs.toml").write_text(f"[settings]\n{bad}\n")
+            try:
+                net_settings()
+                ok(False, f"web: bad setting is an error: {bad}")
+            except ValueError:
+                ok(True, "")
+        (cdir / "jobs.toml").write_text('[settings]\nname = "kmbp"\nweb = ["kvps"]\nweb_port = 9100\nweb_writes = true\n'
+                                        '[settings.web_bind]\nkvps = "100.68.171.58"\n')
+        hdir = tmp / "web-host"
+        hdir.mkdir()
+        (hdir / "net.toml").write_text(net_toml("kvps", net_settings()))
+        g["CONFIG"] = hdir
+        hn = net_settings()
+        ok(hn["web"] == ["kvps"] and hn["self"] == "kvps" and hn["web_port"] == 9100 and hn["web_writes"]
+           and hn["web_bind"] == {"kvps": "100.68.171.58"} and "kmbp" in hn["hosts"],
+           "web: push carries the web settings to the host in net.toml, and the host is a web host")
+        ctx = {**CTX, "state": str(tmp / "web-st")}
+        argv = web_service_argv(ctx, hn)
+        ok(argv[:3] == [CTX["python"], CTX["script"], "web"] and argv[argv.index("--port") + 1] == "9100"
+           and argv[argv.index("--bind") + 1] == "100.68.171.58" and argv[-1] == "--allow-writes",
+           "web: the service command carries the port, the bind address and the writes flag")
+        ok(web_service_argv(ctx, {**hn, "self": "kwin"}) is None and "--allow-writes" not in web_service_argv(ctx, {**hn, "web_writes": False}),
+           "web: a device outside `web` has no service, and writes are off unless asked for")
+    finally:
+        g["CONFIG"] = saved
+
+    scope = {m: web_scope({"status": m}) for m in STATUS_MODES}
+    ok(scope == {"master": "net", "all": "net", "client": "net", "none": "off"},
+       f"web: a web host shows every device in master, all and client mode; none turns it off ({scope})")
+
+    ts = lambda out: (lambda argv, **k: subprocess.CompletedProcess(argv, 0, out, ""))
+    ok(tailscale_ip(ts("100.88.181.49\nfd7a:115c::1\n"), lambda n: "/x/tailscale", lambda p: True) == "100.88.181.49"
+       and tailscale_ip(ts("fd7a:115c::1\n"), lambda n: "/x/tailscale", lambda p: True) is None
+       and tailscale_ip(ts("100.1.1.1"), lambda n: None, lambda p: False) is None,
+       "web: the bind address is the Tailscale IPv4; no tailscale means none")
+    nn = {"self": "kvps", "web_bind": {"kvps": "100.9.9.9"}}
+    ok(web_bind_addr("127.0.0.1", nn, lambda: "100.1.1.1") == "127.0.0.1" and web_bind_addr(None, nn, lambda: "100.1.1.1") == "100.9.9.9"
+       and web_bind_addr(None, {**nn, "web_bind": {}}, lambda: "100.1.1.1") == "100.1.1.1",
+       "web: --bind wins over settings.web_bind, which wins over the Tailscale address")
+    try:
+        web_bind_addr(None, {**nn, "web_bind": {}}, lambda: None)
+        ok(False, "web: no address means no server, never a wildcard")
+    except SystemExit:
+        ok(True, "")
+    hosts_ok = {h: host_ok(h) for h in ("100.68.171.58:8787", "[::1]:8787", "localhost:1", "kvps:8787", "kvps.tail1234.ts.net",
+                                        "evil.example.com", "evil.com:80", "")}
+    ok([k for k, v in hosts_ok.items() if not v] == ["evil.example.com", "evil.com:80", ""], f"web: Host header check ({hosts_ok})")
+
+    # the service on each OS
+    ctx = {**CTX, "state": str(tmp / "web-st")}
+    cmd = [CTX["python"], CTX["script"], "web", "--spec", CTX["spec"], "--state", ctx["state"], "--port", "8787"]
+    pl = plistlib.loads(render_web_launchd(cmd, ctx))
+    ok(pl["KeepAlive"] is True and pl["RunAtLoad"] is True and pl["ProgramArguments"] == cmd and pl["Label"] == "dev.takt-web",
+       "web: the launchd agent has KeepAlive and runs at load")
+    sd = render_web_systemd(cmd, ctx)
+    ok("Restart=always" in sd and "WantedBy=default.target" in sd and "Type=simple" in sd and "ExecStart=" + CTX["python"] in sd,
+       "web: the systemd user service restarts always and starts with the user manager")
+    x = render_web_schtasks(["C:\\Py\\python.exe", "C:\\t\\takt.py", "web"])
+    root = ET.fromstring(x)
+    q = lambda t: root.iter(f"{{{TS_NS}}}{t}")
+    ok(len(list(q("LogonTrigger"))) == 1 and not list(q("CalendarTrigger")) and next(q("Command")).text.endswith("pythonw.exe")
+       and next(q("ExecutionTimeLimit")).text == "PT0S" and list(q("RestartOnFailure")),
+       "web: the Windows task starts at logon, has no time limit, restarts on failure and uses pythonw")
+    ok(not WEB_LABEL.startswith(PREFIX + ".") and not WEB_UNIT.startswith("takt-") and not WEB_TASK.startswith("\\takt\\"),
+       "web: the service names lie outside the job namespaces")
+
+    for be, pre in (("launchd", "dev.takt-web.plist"), ("systemd", "takt.web.service"), ("schtasks", "takt.web.xml")):
+        d = tmp / f"web-{be}"
+        d.mkdir()
+        spec = {"new": mkjob("new", schedule="0 * * * *")}
+        up = plan_admin("install", spec, be, d, [], {}, ctx=ctx, web=cmd)
+        ok(any(k == "write" and a.name == pre for k, a, _ in up), f"web: install on a web host writes the service ({be})")
+        ok(be != "systemd" or any(c[:3] == ["systemctl", "--user", "restart"] and c[3] == "takt.web.service" for k, c, _ in up if k == "run"),
+           "web: install starts the systemd service")
+        ok(be != "schtasks" or any(k == "run" and c[:2] == ["schtasks", "/Run"] for k, c, _ in up), "web: install starts the Windows task")
+        down = plan_admin("install", spec, be, d, [], {}, ctx=ctx, web=False)
+        ok(not any(a == d / pre for k, a, _ in down), f"web: a device that is not a web host has nothing to retire ({be})")
+        (d / pre).write_text("x")
+        ok(installed_ids(be, d, "") == [], f"web: the service file is not listed as a job named web ({be})")
+        (d / ("takt-web.service" if be == "systemd" else "takt-web.xml" if be == "schtasks" else "dev.takt.web.plist")).write_text("job")
+        retire = plan_admin("install", spec, be, d, [], {}, ctx=ctx, web=False)
+        ok(("rm", d / pre, None) in retire, f"web: install on a device that left `web` retires the service ({be})")
+        ok(("rm", d / "takt-web.service", None) not in retire and ("rm", d / "takt-web.xml", None) not in retire
+           and ("rm", d / "dev.takt.web.plist", None) not in retire, f"web: retiring the service leaves a job named web alone ({be})")
+        un = plan_admin("uninstall", {}, be, d, [], {}, web=False)
+        ok(("rm", d / pre, None) in un, f"web: uninstall removes the service ({be})")
+        ok(("rm", d / pre, None) not in plan_admin("uninstall", {}, be, d, [], {}, ids=["x"], web=False),
+           f"web: uninstall of one job leaves the service ({be})")
+        ok(("rm", d / pre, None) not in plan_admin("uninstall", {}, be, d, [], {}), f"web: plan_admin without `web` does not touch it ({be})")
+    ok(any(c[:2] == ["launchctl", "bootout"] for k, c, _ in plan_web("launchd", ctx, tmp / "web-launchd", None, {WEB_LABEL})),
+       "web: a loaded launchd agent is booted out before it is removed")
+    ok(any(c[:2] == ["launchctl", "bootout"] for k, c, _ in plan_web("launchd", ctx, tmp / "web-launchd", cmd, {WEB_LABEL})),
+       "web: a reinstall boots the loaded launchd agent out first")
+
+    # a live server on 127.0.0.1, with the outside world stubbed
+    calls = []
+    me = {"self": "kvps", "hosts": {"kmbp": {"python": "p"}, "kwin": {"python": "w"}}, "status": "master", "web": ["kvps"],
+          "web_port": 0, "web_writes": False, "web_bind": {}}
+
+    def remote(h, c):
+        if h == "kwin":
+            return [{"host": h, "id": "-", "sched": "-", "status": "unreachable", "last": None, "next": None, "detail": "ssh down"}]
+        return [{"host": h, "id": "j", "sched": "on", "status": "ok", "last": None, "next": None, "detail": "", "record": {"x": 1}}]
+
+    def serve(writes):
+        app = WebApp(me, tmp / "nospec.toml", tmp / "web-st", writes, run=lambda a: (calls.append(a), (0, "ran"))[1], remote=remote,
+                     local_rows=lambda: [{"id": "mine", "sched": "on", "status": "ok", "last": None, "next": None, "detail": ""}])
+        app.quiet = True
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), web_handler(app))
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def http(url, data=None, headers=None):
+        req = urllib.request.Request(url, data=data, headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    post = lambda base, body, h=None: http(base + "/api/act", json.dumps(body).encode(), {"X-Takt": "1", **(h or {})})
+    srv, base = serve(False)
+    try:
+        code, body = http(base + "/api/status")
+        d = json.loads(body)
+        by = {(r["host"], r["id"]): r for r in d["rows"]}
+        ok(code == 200 and set(by) == {("kvps", "mine"), ("kmbp", "j"), ("kwin", "-")} and by[("kwin", "-")]["status"] == "unreachable"
+           and d["writes"] is False and "record" not in by[("kmbp", "j")],
+           "web: /api/status has this device's rows and every peer's, and an unreachable peer is a row")
+        ok("takt" in http(base + "/")[1] and http(base + "/")[0] == 200, "web: / serves the page")
+        code, body = http(base + "/api/show?host=kmbp&id=j")
+        ok(code == 200 and body == "ran" and calls[-1][0] == "ssh" and "BatchMode=yes" in calls[-1] and calls[-1][-1].endswith("show j"),
+           "web: show of a peer runs takt over ssh without a password prompt")
+        http(base + "/api/show?host=kvps&id=mine")
+        ok(calls[-1][1:3] == [str(Path(__file__).resolve()), "show"] or calls[-1][2] == "show", "web: show of this device runs locally")
+        n = len(calls)
+        ok(http(base + "/api/show?host=nope&id=j")[0] == 400 and http(base + "/api/show?host=kvps&id=a%20b")[0] == 400 and len(calls) == n,
+           "web: an unknown device or a bad job id runs nothing")
+        ok(http(base + "/api/status", headers={"Host": "evil.example.com"})[0] == 403, "web: a foreign Host header is refused")
+        ok(post(base, {"host": "kmbp", "id": "j", "verb": "start"})[0] == 403 and len(calls) == n,
+           "web: without --allow-writes a POST starts nothing")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    srv, base = serve(True)
+    try:
+        ok(json.loads(http(base + "/api/status")[1])["writes"] is True, "web: with --allow-writes the page gets the buttons")
+        n = len(calls)
+        code, _ = post(base, {"host": "kmbp", "id": "j", "verb": "start"})
+        ok(code == 200 and len(calls) == n + 1 and calls[-1][-1].endswith("start j --allow-writes"),
+           "web: with --allow-writes a POST runs the verb on that device")
+        ok(http(base + "/api/act", json.dumps({"host": "kmbp", "id": "j", "verb": "start"}).encode())[0] == 403
+           and post(base, {"host": "kmbp", "id": "j", "verb": "start"}, {"Origin": "http://evil.example.com"})[0] == 403 and len(calls) == n + 1,
+           "web: a POST needs the X-Takt header and no foreign Origin (CSRF)")
+        ok(post(base, {"host": "kmbp", "id": "j", "verb": "rm"})[0] == 400 and post(base, {"host": "kmbp", "id": "j; rm", "verb": "start"})[0] == 400
+           and len(calls) == n + 1, "web: only start, enable and disable run, and only for a plain job id")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    app = WebApp({**me, "status": "none"}, tmp / "x", tmp / "y", False, remote=remote, local_rows=lambda: [{"id": "a"}])
+    ok(app.rows()["rows"] == [], "web: settings.status = none shows no rows")
+    ok(build_parser().parse_args(["web", "--bind", "127.0.0.1", "--port", "1"]).port == 1
+       and "web" in starter_spec() and 'web = ["myvps"]' in starter_spec(), "web: the CLI has `web`, and takt init mentions it")
 
 
 def check_windows_last(ok):

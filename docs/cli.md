@@ -15,6 +15,7 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 | `takt status --json` | The same rows as JSON, for other tools. |
 | `takt show <id>` | Shows the last record of a job: steps, exit codes, step notes, preflight, and the end of its logs. |
 | `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. If the job is already running, also while it waits for a lock, takt says so and starts nothing. Needs `--allow-writes`. |
+| `takt web [--bind A] [--port N] [--allow-writes]` | Serves the dashboard on the Tailscale address of this device. `install` runs it as a service on the devices in `settings.web`. See [web.md](web.md). |
 | `takt enable <id>` | Arms the schedule of an installed job. Needs `--allow-writes`. |
 | `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
 
@@ -31,7 +32,7 @@ The takt-net is the controller (the device with the `jobs.<host>.toml` files) an
 | `client` | On every device: only its own jobs. |
 | `none` | Nothing. |
 
-`takt status --here` shows the jobs of this device in every mode. `takt show <id>` is not affected, so the TUI on the master can preview any device. Run `takt --host <h> push --allow-writes` after you change the mode, so each host gets it.
+A device in `[settings] web` shows every device on its web page whatever the mode is, except `none` ([web.md](web.md#which-devices-the-page-shows)). `takt status --here` shows the jobs of this device in every mode. `takt show <id>` is not affected, so the TUI on the master can preview any device. Run `takt --host <h> push --allow-writes` after you change the mode, so each host gets it.
 
 ## Setup
 
@@ -58,6 +59,8 @@ Before `install` and `uninstall` plan anything, takt reads the job list of the s
 `uninstall` stops only the jobs that the scheduler has registered, including a run that is in progress: launchd boots out the job, systemd stops the timer and the service, and Task Scheduler ends the task before it deletes it. If the scheduler refuses a stop, takt prints the error, exits with 1 and keeps the files of that job.
 
 The scheduled command includes the `--spec` and `--state` paths that `install` used, as absolute paths. A job installed with `--state some/dir` keeps its records and locks there.
+
+On a device named in `[settings] web`, `install` also installs and starts the web service, and on any other device it retires that service. `uninstall` without ids removes it. See [web.md](web.md).
 
 `install` also retires what a job names in `replaces` (see [jobs.md](jobs.md#replaces)).
 
