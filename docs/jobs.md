@@ -19,6 +19,9 @@ stderr = "~/.local/state/takt/backup.err"
 | Key | Meaning |
 |---|---|
 | `python` | The interpreter that the scheduler uses to run takt. Use a stable path. On macOS, use `/opt/homebrew/bin/python3`, because the real path of Homebrew Python changes with each upgrade. On Windows, use the full path to `python.exe`, because `python3` is often the Microsoft Store stub. |
+| `status` | Where job statuses show: `master` (default), `all`, `client` or `none`. See [Status across devices](cli.md#status-across-devices). Set it on the controller. |
+| `master` | The device that shows all statuses in `master` mode. Default: the controller. |
+| `name` | The name of this device in the takt-net. Default: its short host name. |
 | `path` | The `PATH` that launchd and systemd give to the job. Write it out in full. A copy of your shell `PATH` can hold temporary directories. |
 
 ## Job keys
