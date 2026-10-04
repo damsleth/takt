@@ -26,7 +26,7 @@ stderr = "~/.local/state/takt/backup.err"
 
 ## Job keys
 
-A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`. Two ids that differ only by case are an error, and Windows device names (`CON`, `NUL`, `COM1` and the like) are not allowed, because the id becomes a file name.
+A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`, and cannot start with `-`. Two ids that differ only by case are an error, and Windows device names (`CON`, `NUL`, `COM1` and the like) are not allowed, because the id becomes a file name.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -72,7 +72,7 @@ Limits:
 - Month names and day names (`JAN`, `MON`) are not supported.
 - A day of month and a day of week in the same expression are not supported. Cron runs on either day, but launchd and systemd need both.
 - Task Scheduler cannot run every minute inside a range of hours (`* 9-17 * * *`).
-- Task Scheduler takes at most 48 triggers per task. takt writes one trigger for each time of day, unless the minutes repeat evenly across all hours (`*/15 * * * *` is 1 trigger). `*/5 9-17 * * 1-5` needs 108, so `install` refuses it on Windows before it changes anything. Use fewer times, or split the job.
+- Task Scheduler takes at most 48 triggers per task. takt writes one trigger for each time of day, unless the minutes repeat evenly across all hours and the step divides 60 (`*/15 * * * *` is 1 trigger; `*/7 * * * *` is 9, because cron starts again at `:00`). `*/5 9-17 * * 1-5` needs 108, so `install` refuses it on Windows before it changes anything. Use fewer times, or split the job.
 
 A schedule that never matches a date (`0 0 30 2 *`) is an error when takt loads the file. Sparse schedules work: takt searches for slots across 8 years, so a yearly job or a job on 29 February finds its slot.
 
