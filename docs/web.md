@@ -73,6 +73,7 @@ The web device does not log in to other devices. Each device sends its own rows 
 - `takt report` sends the rows now.
 - All sends of one run share a budget of 8 seconds, address lookups included. A web device that is left when the budget is spent is skipped. If the web device does not answer, the job is not affected, and the error goes to the log of the job. The next run sends the full rows again.
 - The device finds the web device with `tailscale ip -4 <name>`, so MagicDNS is not necessary. `[settings.web_bind]` overrides the address.
+- On macOS with the Tailscale app, set `[settings.web_bind]` for each web device. Under launchd the app binary prints "The Tailscale GUI failed to start" instead of an address, so the lookup fails and every report goes to the bare name, which does not resolve. The job log shows `report to <name>: URLError: ... nodename nor servname provided`.
 
 The web device accepts a report only if Tailscale confirms the sender. It runs `tailscale whois` on the address of the caller. The first part of the machine name (`kmbp` in `kmbp.example.ts.net`) must be the device that the report names, and that device must be a member of the takt-net. If Tailscale does not know the address, or if the `tailscale` command is missing, the report is refused. A report holds rows only. It cannot run anything.
 
@@ -94,6 +95,39 @@ The server is read-only. Start it with `--allow-writes`, or set `web_writes = tr
 - A write request needs the header `X-Takt: 1`, and an `Origin` header, if present, must be the server. A web page on another origin cannot send this header without a preflight, and the server does not answer preflights.
 - The device must be this device or a member of the net. The job id must be a plain id. The action must be one of the three.
 
+## Behind a reverse proxy
+
+To serve the page with TLS on a name of your own, put a reverse proxy on the web device and keep the name inside the tailnet:
+
+- A DNS record for the name points to the Tailscale address of the web device, with no proxying by a CDN.
+- The proxy allows only tailnet addresses (`100.64.0.0/10` and `fd7a:115c:a1e0::/48`) and denies all other clients.
+- The proxy sends the upstream address as `Host` (in nginx, the default `$proxy_host`), so the `Host` check of takt passes. Do not forward the public name: takt refuses a `Host` with a dot that is not `.ts.net`.
+- If `web_writes` is on, the proxy translates the `Origin` of the page to the upstream address. Otherwise takt refuses the buttons, because `Origin` and `Host` differ.
+
+An nginx example, for `takt.example.com` and a web device at `100.64.0.7`:
+
+```nginx
+map $http_origin $takt_origin {
+    "https://takt.example.com" "http://100.64.0.7:8787";
+    default                    $http_origin;
+}
+server {
+    listen 443 ssl;
+    server_name takt.example.com;
+    allow 100.64.0.0/10;
+    allow fd7a:115c:a1e0::/48;
+    deny  all;
+    location / {
+        proxy_pass       http://100.64.0.7:8787;
+        proxy_set_header Origin $takt_origin;
+    }
+}
+```
+
+If the proxy trusts a real-IP header (for example from a CDN), make sure that it trusts the header only from the CDN addresses. Otherwise a client can send a tailnet address in the header.
+
+Reports do not go through the proxy. The devices send them to the address and port of `takt web`.
+
 ## Command
 
 ```sh
@@ -104,5 +138,5 @@ Run it by hand to try it. Use `--bind 127.0.0.1` to test on one machine. Press `
 
 ## Not built
 
-- Login, TLS and users. The tailnet is the boundary. Add them if the page must be open to more than one person.
+- Login, TLS and users. The tailnet is the boundary. For TLS, see "Behind a reverse proxy". Add them if the page must be open to more than one person.
 - Live logs and run history. The page shows the last record, as `takt show` does.
