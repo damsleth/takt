@@ -44,6 +44,8 @@ A job is a `[job.<id>]` table. The id can contain letters, digits, `-` and `_`, 
 | `on_event` | none | Windows only. An event query (the XML of a Task Scheduler event trigger) that also starts the job, for example a Remote Desktop session event. launchd and systemd refuse a job with `on_event`. |
 | `bundle` | none | macOS only. The `AssociatedBundleIdentifiers` value of the plist. |
 | `replaces` | `[]` | Old schedules that `install` retires. See [replaces](#replaces). |
+| `notify` | none | Where takt sends notices: `ntfy://<topic>` (ntfy.sh), or an `http://` or `https://` URL that takes a POST. See [Notifications](#notifications). |
+| `notify_after` | `1` | The number of bad runs in a row before takt sends one alert. |
 
 ### Steps
 
@@ -59,9 +61,65 @@ report = "json-failed-sources"
 stdout = "~/.local/state/takt/ingest.log"
 ```
 
-Steps run in order. A failed step does not stop the next step. Each step has `id`, `command`, `stdout`, `stderr` and `report`.
+Steps run in order. A failed step does not stop the next step. Each step has `id`, `command`, `stdout`, `stderr`, `report` and `timeout`. Two steps of a job cannot have the same `id`.
+
+`timeout` is the longest time a step can run: seconds, or a text such as `"90s"`, `"10m"`, `"2h"` or `"1d"`. When the time is over, takt ends the step and each process that it started, and the step is `failed` with the note `timed out after <n>s`. Without `timeout`, a step can run for any length of time, except a watch step (60 seconds).
 
 `report = "json-failed-sources"` reads the last JSON line of the step output. If `error.failed_sources` holds names, the step is `partial` and the names show in the status, also when the step exits with 0. If `error` is not an object (`{"error": "connection refused"}`), its text becomes the note of the step.
+
+## Watches
+
+A watch step tells you when its output changes. Set `report = "watch"`. The command prints a value, and takt compares it with the value that it told you last time. A single-command job can set the watch keys in the job table:
+
+```toml
+[job.ado-item]
+schedule = "*/10 * * * *"
+needs = ["owa:nc"]
+notify = "ntfy://my-topic"
+command = "owa-ado wi 18648 -P NOCOS | jq -r '.fields.\"System.ChangedDate\"'"
+report = "watch"
+compare = "changed"
+cooldown = "30m"
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `compare` | `"changed"` | How takt compares the output. See the table below. |
+| `target` | none | The number for `above` and `below`, or the value for `equals`. |
+| `expect` | none | A regular expression. If the output does not match, the read is broken. |
+| `cooldown` | `0` | The shortest time between two notices of this step. takt keeps a notice that comes too early and sends it after the cooldown. |
+| `flap_max` | `0` (off) | If the value moves more than this many times in `flap_window`, takt stops the separate notices. At the end of the window it sends one digest. |
+| `flap_window` | `"1h"` | The window for `flap_max`. |
+
+| `compare` | takt tells you when |
+|---|---|
+| `changed` | The output is different from the value that it told you last time. |
+| `above`, `below` | The number goes above or below `target`. takt tells you again only after the value goes back. |
+| `equals` | The output becomes `target`. |
+| `new-items` | A line comes that takt has not seen before. Each line is an item. takt remembers the last 10000 items. |
+
+Rules:
+
+- **A broken read is not a change.** If the command exits with an error, runs past `timeout`, prints nothing, does not match `expect`, or prints no number for `above` or `below`, the step is `failed`. takt does not compare the output, and it keeps the last good value. Failed runs go to the failure alerts, see [Notifications](#notifications).
+- **A new watch does not send a notice.** The first read of `changed` and `new-items` is the start value. For `above`, `below` and `equals`, a value that is already in the state at the first read sends one notice.
+- **One notice for each change.** A value that stays changed, or stays above the line, sends no more notices.
+- **The note shows the result.** The note of the step tells what happened in each run: `baseline`, `no change`, `A -> B`, `2 new`, `flapping`, or the reason that a notice waits. `status` and the dashboard show the note.
+
+takt keeps the state of each watch in `<state>/notify/<id>.json`.
+
+## Notifications
+
+A job with `notify` sends notices. A job without `notify` sends nothing: the notes in its records still show what takt would tell you.
+
+| Notice | When |
+|---|---|
+| Failure alert | The job is `failed`, `partial`, `skipped` or `lock-timeout` for `notify_after` runs in a row. takt sends one alert for each series of bad runs. The text is the status and the detail of the run. |
+| Recovery | The first `ok` run after a failure alert. |
+| Watch notice | A watch step saw a change. See [Watches](#watches). |
+
+takt sends each notice as a POST. The body is the text, and the `Title` header is `takt <device>: <job id>`. `ntfy://<topic>` sends to `https://ntfy.sh/<topic>`. If a notice cannot be sent, takt records `notify_error` and does not mark the notice as sent. The next run sends it again. The record holds the notices that it sent in `sent`, and `takt show` lists them.
+
+`run --dry-run` sends nothing.
 
 ## Schedules
 

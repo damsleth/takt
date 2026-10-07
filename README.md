@@ -1,6 +1,6 @@
 # takt
 
-Declare scheduled jobs once. takt runs every job through a wrapper that takes turns with other jobs, records why a job skipped, and reports the sub-step that failed.
+Declare scheduled jobs once. takt runs every job through a wrapper that takes turns with other jobs, records why a job skipped, reports the sub-step that failed, and can tell you when a job fails or a watched value changes.
 
 One file drives launchd on macOS, systemd on Linux and Task Scheduler on Windows. It does this on your machine and, over ssh, on your other hosts.
 
@@ -50,6 +50,17 @@ after = ["token-refresh"]
 command = ["/usr/local/bin/ingest", "--json"]
 ```
 
+Tell you when a work item changes, and when the check itself breaks. A failed read (an expired token, an error page) is a failure alert, never a change:
+
+```toml
+[job.ado-item]
+schedule = "*/10 * * * *"
+notify = "ntfy://my-topic"
+command = 'owa-ado wi 18648 | jq -r .fields.\"System.ChangedDate\"'
+report = "watch"
+cooldown = "30m"
+```
+
 Install and start a job on another host. `~/.config/takt/jobs.myvps.toml` declares the jobs for `ssh myvps`:
 
 ```sh
@@ -71,7 +82,7 @@ kwin   probe         on     ok      10-02 22:10  10-02 22:15
 ## Docs
 
 - [Commands](docs/cli.md): every command, the TUI keys, environment variables.
-- [Jobs file](docs/jobs.md): all keys, schedules, preflight checks, status values.
+- [Jobs file](docs/jobs.md): all keys, schedules, preflight checks, watches, notifications, status values.
 - [Web dashboard](docs/web.md): `takt web`, which devices serve it, and how the other devices report to it.
 - [Hosts](docs/hosts.md): other hosts over ssh, Linux and Windows setup.
 - [Design](docs/design.md): how locks, ordering, catch-up and status work, and the measurements.
