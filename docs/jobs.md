@@ -88,7 +88,7 @@ cooldown = "30m"
 | `target` | none | The number for `above` and `below`, or the value for `equals`. |
 | `expect` | none | A regular expression. If the output does not match, the read is broken. |
 | `cooldown` | `0` | The shortest time between two notices of this step. takt keeps a notice that comes too early and sends it after the cooldown. |
-| `flap_max` | `0` (off) | If the value moves more than this many times in `flap_window`, takt stops the separate notices. At the end of the window it sends one digest. |
+| `flap_max` | `0` (off) | If the value moves more than this many times in `flap_window`, takt stops the separate notices. At the end of the window, and after the cooldown, it sends one digest with the number of moves. |
 | `flap_window` | `"1h"` | The window for `flap_max`. |
 
 | `compare` | takt tells you when |
@@ -100,7 +100,7 @@ cooldown = "30m"
 
 Rules:
 
-- **A broken read is not a change.** If the command exits with an error, runs past `timeout`, prints nothing, does not match `expect`, or prints no number for `above` or `below`, the step is `failed`. takt does not compare the output, and it keeps the last good value. Failed runs go to the failure alerts, see [Notifications](#notifications).
+- **A broken read is not a change.** If the command exits with an error, runs past `timeout`, prints nothing, does not match `expect`, or prints no finite number for `above` or `below` (`nan` and `inf` are not numbers here), the step is `failed`. takt does not compare the output, and it keeps the last good value. Failed runs go to the failure alerts, see [Notifications](#notifications).
 - **A new watch does not send a notice.** The first read of `changed` and `new-items` is the start value. For `above`, `below` and `equals`, a value that is already in the state at the first read sends one notice.
 - **One notice for each change.** A value that stays changed, or stays above the line, sends no more notices.
 - **The note shows the result.** The note of the step tells what happened in each run: `baseline`, `no change`, `A -> B`, `2 new`, `flapping`, or the reason that a notice waits. `status` and the dashboard show the note.
@@ -117,7 +117,7 @@ A job with `notify` sends notices. A job without `notify` sends nothing: the not
 | Recovery | The first `ok` run after a failure alert. |
 | Watch notice | A watch step saw a change. See [Watches](#watches). |
 
-takt sends each notice as a POST. The body is the text, and the `Title` header is `takt <device>: <job id>`. `ntfy://<topic>` sends to `https://ntfy.sh/<topic>`. If a notice cannot be sent, takt records `notify_error` and does not mark the notice as sent. The next run sends it again. The record holds the notices that it sent in `sent`, and `takt show` lists them.
+takt sends each notice as a POST. The body is the text, and the `Title` header is `takt <device>: <job id>`. `ntfy://<topic>` sends to `https://ntfy.sh/<topic>`. If a notice cannot be sent, takt records `notify_error` and does not mark the notice as sent. The next run sends it again. If a failure alert cannot be sent and the next run is `ok`, the recovery notice includes the failure. The record holds the notices that it sent in `sent`, and `takt show` lists them.
 
 `run --dry-run` sends nothing.
 

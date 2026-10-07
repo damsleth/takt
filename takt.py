@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import plistlib
 import re
@@ -189,6 +190,17 @@ def _argv(c):
     return ["/bin/sh", "-c", c] if isinstance(c, str) else list(c)
 
 
+def notify_ok(n):
+    if not (isinstance(n, str) and NOTIFY_RE.fullmatch(n)):
+        return False
+    if n.startswith("ntfy://"):
+        return True
+    try:
+        return bool(urlsplit(n).hostname)
+    except ValueError:  # "https://[" and other URLs that urllib cannot build a request for
+        return False
+
+
 def seconds(v, what):
     """90, "90s", "10m", "2h" or "1d" -> seconds."""
     if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
@@ -249,8 +261,8 @@ def normalize(jid, j) -> dict:
            "lock_timeout": int(j.get("lock_timeout", 900)), "replaces": list(j.get("replaces", [])),
            "on_event": j.get("on_event"), "notify": j.get("notify"),
            "notify_after": int(j.get("notify_after", 1)), "steps": steps}
-    if job["notify"] is not None and not (isinstance(job["notify"], str) and NOTIFY_RE.fullmatch(job["notify"])):
-        raise ValueError(f"job {jid}: notify is ntfy://<topic> or an https:// URL")
+    if job["notify"] is not None and not notify_ok(job["notify"]):
+        raise ValueError(f"job {jid}: notify is ntfy://<topic> or an http(s):// URL with a host")
     if job["notify_after"] < 1:
         raise ValueError(f"job {jid}: notify_after must be 1 or more")
     for n in job["needs"] + job["wants"]:  # "kind:arg", or a command as an argv list that passes on exit 0
@@ -387,11 +399,12 @@ class Locks:
     """Named flocks, taken in sorted order so two jobs can never deadlock.
     flock dies with the last process holding it, so a crashed job cannot wedge the lock."""
 
-    def __init__(self, state: Path, names, timeout, sub="locks"):
+    def __init__(self, state: Path, names, timeout, sub="locks", cleanup=True):
         # lowercase: on macOS and Windows "JOB-j" and "job-j" are one file, and taking it twice would
-        # wait on itself
-        self.dir, self.names, self.timeout, self.fds, self.blocked_on = (
-            state / sub, sorted({n.lower() for n in names}), timeout, [], None)
+        # wait on itself. cleanup=False: a short inner lock (the notify state) that must not end the
+        # job's leftovers in the middle of a run, before the caller of a pulled-in dependency runs.
+        self.dir, self.names, self.timeout, self.fds, self.blocked_on, self.cleanup = (
+            state / sub, sorted({n.lower() for n in names}), timeout, [], None, cleanup)
 
     def __enter__(self):
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -415,7 +428,7 @@ class Locks:
         return self
 
     def __exit__(self, *a):
-        if self.fds:
+        if self.fds and self.cleanup:
             for hook in BEFORE_UNLOCK:  # Windows: end the job's leftovers first
                 hook(self)
         for f in self.fds:
@@ -588,9 +601,10 @@ def watch_value(step, text):
         return None, f"output does not match expect: {out[:60]!r}"
     if step["compare"] in ("above", "below"):
         try:
-            float(out)
+            if not math.isfinite(float(out)):  # nan and inf parse, and would re-arm a threshold
+                raise ValueError
         except ValueError:
-            return None, f"not a number: {out[:60]!r}"
+            return None, f"not a finite number: {out[:60]!r}"
     if step["compare"] == "new-items":
         return "\n".join(dict.fromkeys(ln.strip() for ln in out.splitlines() if ln.strip())), None
     return out, None
@@ -620,6 +634,9 @@ def kill_tree(pid):
             pass
 
 
+DRAIN_S = 5  # seconds to read what a killed step left in its pipe
+
+
 def run_step(step):
     t0 = time.time()
     rec = {"id": step["id"], "exit": None, "failed": [], "note": None}
@@ -634,7 +651,13 @@ def run_step(step):
             out, _ = p.communicate(timeout=step.get("timeout"))
         except subprocess.TimeoutExpired:
             kill_tree(p.pid)
-            out, _ = p.communicate()
+            try:
+                out, _ = p.communicate(timeout=DRAIN_S)
+            except subprocess.TimeoutExpired:  # a child that left the tree (its parent exited) holds the pipe
+                if p.stdout:
+                    p.stdout.close()
+                p.wait()
+                out = b""
             broken, rec["note"] = True, f"timed out after {step['timeout']:g}s"
         rec["exit"] = p.returncode
         if cap:
@@ -737,15 +760,17 @@ def watch(step, st, value, now, send):
     st["last"] = value
     st["moves"] = [t for t in st.get("moves", []) + ([now] if moved else []) if t > now - step["flap_window"]]
     if st.get("flap_until") is None and moved and step["flap_max"] and len(st["moves"]) > step["flap_max"]:
-        st.update(flap_until=now + step["flap_window"], flap_from=st["told"])  # entering needs a real move
+        # entering needs a real move; the digest counts every move inside the window from here
+        st.update(flap_until=now + step["flap_window"], flap_from=st["told"], flap_moves=len(st["moves"]))
         return "flapping"
     if st.get("flap_until") is not None:
-        if now < st["flap_until"]:
+        st["flap_moves"] = st.get("flap_moves", 0) + moved
+        if now < st["flap_until"] or not cooled:  # the digest is a notice too: it waits for the cooldown
             return "flapping"
-        if not send(f"moved {len(st['moves'])} times in {step['flap_window'] / 60:g} min; "
-                    f"was {short(st['flap_from'])}, now {short(value)}"):
+        if not send(f"moved {st['flap_moves']} times while flapping; was {short(st['flap_from'])}, now {short(value)}"):
             return "flapping, notify failed"
-        st.update(told_at=now, told=value, told_in=not changed and in_state(step, value), flap_until=None, flap_from=None)
+        st.update(told_at=now, told=value, told_in=not changed and in_state(step, value), flap_until=None,
+                  flap_from=None, flap_moves=0)
         return "flap digest"
     if changed:
         want, text = value != st["told"], f"{short(st['told'])} -> {short(value)}"
@@ -770,9 +795,9 @@ def deliver(url, title, text):
     """POST one notice. ntfy://topic is https://ntfy.sh/topic. -> None, or why it failed."""
     if url.startswith("ntfy://"):
         url = "https://ntfy.sh/" + url[len("ntfy://"):]
-    req = urllib.request.Request(url, data=text.encode("utf-8"), method="POST",
-                                 headers={"Title": title.encode("ascii", "replace").decode()})
     try:
+        req = urllib.request.Request(url, data=text.encode("utf-8"), method="POST",
+                                     headers={"Title": title.encode("ascii", "replace").decode()})
         urllib.request.urlopen(req, timeout=15).read()
         return None
     except (OSError, ValueError) as e:
@@ -799,18 +824,27 @@ def finish(job, rec, state, now=None, say=print):
         return True
 
     try:
-        with Locks(state, [job["id"]], 30, sub="notify"):  # also a lock-timeout run writes this state
+        with Locks(state, [job["id"]], 30, sub="notify", cleanup=False):  # a lock-timeout run writes it too
             f = state / "notify" / f"{job['id'].lower()}.json"
             try:
                 ns = json.loads(f.read_text())
             except (OSError, ValueError):
                 ns = {}
-            bad = rec["status"] in BAD
+            bad, after = rec["status"] in BAD, job.get("notify_after", 1)
             fails = ns.get("fails", 0) + 1 if bad else 0
-            if bad and fails >= job.get("notify_after", 1) and not ns.get("alerted"):
-                ns["alerted"] = send(f"{rec['status']}: {detail_of(rec) or rec.get('note') or 'no detail'}")
-            elif not bad and ns.get("alerted"):
-                ns["alerted"] = not send(f"ok again after {ns.get('fails', 0)} bad runs")
+            if bad:
+                # streak: the bad runs that the user must hear about. It stays until the recovery is told.
+                ns["streak"] = max(fails, ns.get("streak", 0)) if ns.get("alerted") else fails
+                ns["last_bad"] = f"{rec['status']}: {detail_of(rec) or rec.get('note') or 'no detail'}"
+                if fails >= after and not ns.get("alerted"):
+                    ns["alerted"] = send(ns["last_bad"])
+            elif ns.get("streak", 0) >= after:
+                # an alert that was never delivered is told now, with the recovery
+                back = f"ok again after {ns['streak']} bad runs"
+                if send(back if ns.get("alerted") else f"{ns['last_bad']}; {back}"):
+                    ns.update(alerted=False, streak=0)
+            else:
+                ns["streak"] = 0
             ns["fails"] = fails
             for s, js in zip(rec["steps"], job["steps"]):
                 if "_value" in s and s["status"] == "ok":
@@ -4507,7 +4541,8 @@ def check_watch(ok, tmp):
     d.mkdir()
     st, sent, fail = d / "st", [], {"err": None}
     real = DELIVER[0]
-    DELIVER[0] = lambda url, title, text: (sent.append((title.rsplit(": ", 1)[-1], text)), fail["err"])[1]
+    # records only what was delivered; fail["err"] makes the next sends fail
+    DELIVER[0] = lambda url, title, text: fail["err"] or sent.append((title.rsplit(": ", 1)[-1], text))
     T = datetime(2026, 10, 7, 12, 0)
     rd = [PY, "-c", "import sys;sys.stdout.write(open(sys.argv[1], encoding='utf-8').read())"]
 
@@ -4649,6 +4684,73 @@ def check_watch(ok, tmp):
         ok(seconds("10m", "") == 600 and seconds("1.5h", "") == 5400 and seconds(90, "") == 90, "spec: durations")
         w = mkjob("rt", command=["x"], report="watch", compare="below", target=0, cooldown="5m", notify="ntfy://t", notify_after=3)
         ok(load_spec(write_spec(d, w))["rt"] == w, "spec: a watch job round-trips through TOML")
+        # 11. the first review (codex): each fix has a check that fails without it
+        # a. releasing the notify lock does not end the job's leftovers (Windows: before a pulled-in caller runs)
+        hooked = []
+        BEFORE_UNLOCK.append(lambda lk: hooked.append(lk.dir.name))
+        try:
+            run(mkjob("leftover", command=[PY, "-c", "pass"], notify="ntfy://t"), 0)
+        finally:
+            BEFORE_UNLOCK.pop()
+        ok("locks" in hooked and "notify" not in hooked, f"review: the notify lock skips the leftover cleanup: {hooked}")
+        # b. a child that outlives its shell holds the pipe: the drain after a timeout is bounded
+        if os.name != "nt":
+            pidf, drain = d / "orphan.pid", DRAIN_S
+            globals()["DRAIN_S"] = 0.3
+            t0 = time.time()
+            try:
+                r = run(mkjob("orphan", command=["/bin/sh", "-c", f"sleep 30 & echo $! > {pidf}; exit 0"],
+                              report="watch", timeout=0.5), 0)
+            finally:
+                globals()["DRAIN_S"] = drain
+                try:
+                    os.kill(int(pidf.read_text()), 9)
+                except (OSError, ValueError):
+                    pass
+            ok(time.time() - t0 < 5 and r["status"] == "failed" and r["steps"][0]["note"] == "timed out after 0.5s",
+               f"review: a pipe held by an orphan does not hang the wrapper ({time.time() - t0:.1f}s)")
+        # c. a failure alert that was never delivered is told with the recovery; a retried recovery keeps the count
+        flag = d / "rev.flag"
+        cmd = [PY, "-c", "import os,sys;sys.exit(1 if os.path.exists(sys.argv[1]) else 0)", str(flag)]
+        j = mkjob("lost", command=cmd, notify="ntfy://t")
+        flag.write_text("")
+        fail["err"] = "ntfy down"
+        run(j, 0)
+        fail["err"] = None
+        flag.unlink()
+        run(j, 60)
+        ok(told("lost") == ["failed: main: failed exit 1; ok again after 1 bad runs"],
+           f"review: an undelivered alert is told with the recovery: {told('lost')}")
+        j = mkjob("late", command=cmd, notify="ntfy://t")
+        flag.write_text("")
+        run(j, 0), run(j, 60)
+        flag.unlink()
+        fail["err"] = "ntfy down"
+        run(j, 120)
+        fail["err"] = None
+        run(j, 180), run(j, 240)
+        ok(told("late") == ["failed: main: failed exit 1", "ok again after 2 bad runs"],
+           f"review: a retried recovery keeps the count, and is sent once: {told('late')}")
+        # d. the flap digest waits for the cooldown, and counts the moves that started the flapping
+        _, tick = watcher("flapcool", cooldown="1h", flap_window="10m", flap_max=1)
+        tick(0, "A"), tick(60, "B")
+        ok(tick(120, "A") == "flapping" and tick(720) == "flapping" and told("flapcool") == ["A -> B"],
+           f"review: no digest inside the cooldown: {told('flapcool')}")
+        ok(tick(60 + 3600) == "flap digest" and told("flapcool")[1:2] == ["moved 2 times while flapping; was B, now A"],
+           f"review: the digest after the cooldown counts the moves: {told('flapcool')}")
+        # e. a URL that urllib cannot build is refused at load, and deliver never raises
+        for bad_url in ("https://[", "https://", "http:///x"):
+            try:
+                mkjob("url", notify=bad_url)
+                ok(False, f"review: notify {bad_url!r} accepted")
+            except ValueError:
+                ok(True, "")
+        ok(isinstance(real("http://[", "t", "x"), str), "review: deliver returns an error for a bad URL, it does not raise")
+        # f. nan and inf are not numbers for above and below
+        _, tick = watcher("finite", compare="above", target=10, notify_after=5)  # no failure alerts here
+        notes = [tick(60 * i, v) for i, v in enumerate(["12", "nan", "12", "inf", "12"])]
+        ok(notes[1] == notes[3] == "failed" and told("finite") == ["12 is above 10"],
+           f"review: nan and inf are broken reads, the threshold stays armed: {notes} {told('finite')}")
     finally:
         DELIVER[0] = real
 
