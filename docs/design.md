@@ -60,6 +60,12 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 `report = "json-failed-sources"` reads `error.failed_sources` from the last JSON line of a step. A step that exits with 0 and reports failed sources is `partial`.
 
+`report = "watch"` compares the output of a step with the value that takt told last time. It is edge-triggered: a value that stays changed sends one notice. A broken read (an error, a timeout, no output, or output that does not match `expect`) is a failed step, and takt does not compare it. An expired token or an error page is then a failure alert, not a change. Cooldown and the flap digest come from kikar, a private watcher prototype. The scheduler gives a watch its schedule, locks, preflight and status, so a watch is one more kind of step.
+
+## Notifications
+
+A job with `notify` sends a failure alert after `notify_after` bad runs in a row, one recovery notice, and the notices of its watch steps. A notice that takt cannot send stays unsent, and the next run sends it. The state lives in `<state>/notify/<id>.json`, under its own lock, because a `lock-timeout` run also writes it.
+
 ## Preflight
 
 `needs` skips the job and records the reason. `wants` records a warning and runs the job. The Full Disk Access check opens the protected file and names the binary that needs the grant: the interpreter in `[settings] python`, not the terminal.
@@ -80,8 +86,8 @@ Each run writes one JSON record: slot, trigger, start time, duration, wait, stat
 
 macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance with lingering), Windows 11 (OpenSSH into PowerShell 7.4, Python 3.11).
 
-- **Self-test**: 181 checks pass on macOS. A copy pushed to Linux passes 176, and Windows passes 175. The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
-- **Mutation tests**: 90 breaks of the logic, each made on a copy: 16, 12, 13, 8, 10, 7, 5, 4, 2 and 3 for the fixes of ten external reviews, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 90. The two job-object breaks ran on Windows. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
+- **Self-test**: 381 checks pass on macOS. A copy run on Linux passes 375 of 376: the one failure, a `push` check of the takt-net settings, fails in the same way on `main` when run from a copy outside the install. Windows has not run this version (an earlier version passed 175 of 181 there). The copies skip the checks of `examples/`. Windows skips the checks that need `chmod 000`, a shell script, or inherited lock files, and runs a job-object check of its own.
+- **Mutation tests**: 103 breaks of the logic, each made on a copy. 13 are for watches and notifications: new items never pending, no cooldown, the told value not moved, a broken read accepted, a timeout that ends only the shell, an alert for each bad run, no recovery notice, a failed delivery taken as sent, no flap collapse, a threshold that never re-arms, a skipped job not counted as bad, `notify_after` ignored, and state that is never saved. The other 90: 16, 12, 13, 8, 10, 7, 5, 4, 2 and 3 for the fixes of ten external reviews, and 9 for ordering, systemd install and uninstall, Task Scheduler XML, ssh arguments and scheduler state. The self-test fails on all 90. The two job-object breaks ran on Windows. 2 breaks of `init` and 9 earlier breaks of the core (locks, `after`, status, preflight, catch-up) failed it in earlier versions.
 - **Leftover processes on Windows**: a step started a background helper and returned while another job waited for the same lock. The helper's last write came 0.054 s before the waiting job started, and no helper was left running.
 - **Task Scheduler trigger limit**: a task with 48 triggers registered on Windows 11, and one with 49 was refused ("The task XML contains too many nodes of the same type").
 - **`takt start` off its slot**: a `catch_up = "skip"` job started at another time ran and recorded the trigger `start` on launchd, systemd and Task Scheduler. On Linux, removing its schedule and reinstalling retired the timer.
@@ -91,6 +97,7 @@ macOS (Python 3.14), Ubuntu 24.04 aarch64 (Python 3.12, systemd user instance wi
 - **Locks**: two real processes in the same minute with a shared lock never overlap, and the second waits and succeeds. The same pair without the lock overlaps, so the test can see the failure. This passes on all three OSes.
 - **Live runs on Linux and Windows**: a probe job installed, fired at its slot from systemd and from Task Scheduler, was disabled, enabled, fired again at the next slot, was started by hand and was uninstalled. `status -A` over three hosts took 3.6 seconds.
 - **Real data on macOS**: `import-plist` read the real token-refresh plist, and `import-cron` read 12 crontab jobs. The rendered plists put every slot at minute 0.
+- **A watch on a live source**: a `new-items` watch read the Bærum planning archive (two `curl` calls and `jq`) into a local HTTP sink. The first read stored 10 cases and sent nothing. The second read found nothing new. With 2 cases removed from the state, it sent exactly those 2. Without the session cookie, `jq` failed (exit 4) twice, and one alert came after the second run (`notify_after = 2`). With the cookie back, it sent one recovery notice. Each read took 1.3 to 2.2 seconds.
 
 Found by the runs:
 
@@ -103,7 +110,8 @@ Not measured yet: a week of real jobs under launchd, a sleep and wake under laun
 
 ## Limits
 
-- A step that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. takt has no step timeout.
+- A step without `timeout` that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. Set `timeout` on a step that reads the network.
+- On Linux and macOS, a timeout ends the processes that the step started, found with `ps`. A process that starts between the `ps` and the kill continues to run.
 - `--check` does not run the installers. They were tested by hand on macOS, Linux and Windows.
 - The Windows installer writes paths under the user profile as `%USERPROFILE%` in `takt.cmd`. A Python path with non-ASCII characters outside the profile stops the installer with an error. No account with a non-ASCII name has been tested.
 - A failed step is recorded. takt does not retry it.
@@ -119,8 +127,9 @@ Each item has the condition that would justify it.
 |---|---|
 | A daemon or a runner that is always on | A job must run while logged out on macOS, or more often than each minute. |
 | Control of jobs that takt did not install | A job outside the jobs file must be started or toggled from the TUI. |
-| Retries and step timeouts | The first real hang or transient failure. |
-| Notifications | Someone picks the reader: a daily note, a task list or a push service. `status --json` is ready for it. |
+| Retries | The first transient failure that a retry would fix. |
+| Notices by mail, Teams or a desktop notification | A reader that cannot take an HTTP POST. |
+| A filter on watch items after a good read | A `new-items` watch must ignore some lines. A filter in the command (`grep`) makes "no match" an empty read, which is a failure. |
 | A curses TUI | The TUI needs panes that fzf cannot show. |
 | Windows tasks that run while logged out | A Windows job must run at the login screen. This needs S4U or a stored password. |
 

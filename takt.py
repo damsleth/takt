@@ -178,16 +178,55 @@ def next_slot(f, now: datetime, days=SEARCH_DAYS):
 
 # ------------------------------------------------------------------- the spec
 
-STEP_KEYS = ("command", "stdout", "stderr", "report")
+WATCH_KEYS = ("compare", "target", "expect", "cooldown", "flap_max", "flap_window")
+STEP_KEYS = ("command", "stdout", "stderr", "report", "timeout") + WATCH_KEYS
+REPORTS = ("json-failed-sources", "watch")
+COMPARE = ("changed", "above", "below", "equals", "new-items")
+NOTIFY_RE = re.compile(r"ntfy://[\w-]+|https?://\S+")
 
 
 def _argv(c):
     return ["/bin/sh", "-c", c] if isinstance(c, str) else list(c)
 
 
-def _norm_step(s, sid):
-    return {"id": s.get("id", sid), "command": _argv(s["command"]),
-            "stdout": s.get("stdout"), "stderr": s.get("stderr"), "report": s.get("report")}
+def seconds(v, what):
+    """90, "90s", "10m", "2h" or "1d" -> seconds."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+        return float(v)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", str(v).strip())
+    if not m:
+        raise ValueError(f"{what}: {v!r} is not a duration (90, \"90s\", \"10m\", \"2h\", \"1d\")")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def _norm_step(s, sid, jid="?"):
+    sid = s.get("id", sid)
+    where = f"job {jid} step {sid}"
+    step = {"id": sid, "command": _argv(s["command"]), "stdout": s.get("stdout"), "stderr": s.get("stderr"),
+            "report": s.get("report"), "timeout": seconds(s["timeout"], f"{where}: timeout") if "timeout" in s else None}
+    if step["report"] not in (None,) + REPORTS:
+        raise ValueError(f"{where}: report must be one of {', '.join(REPORTS)}")
+    if step["report"] != "watch":
+        if extra := [k for k in WATCH_KEYS if k in s]:
+            raise ValueError(f"{where}: {', '.join(extra)} need report = \"watch\"")
+        return step
+    cmp, target = s.get("compare", "changed"), s.get("target")
+    if cmp not in COMPARE:
+        raise ValueError(f"{where}: compare must be one of {', '.join(COMPARE)}")
+    if cmp in ("above", "below") and (not isinstance(target, (int, float)) or isinstance(target, bool)):
+        raise ValueError(f"{where}: compare = \"{cmp}\" needs a number as target")
+    if cmp == "equals" and target is None:
+        raise ValueError(f"{where}: compare = \"equals\" needs a target")
+    try:
+        re.compile(s.get("expect") or "")
+    except re.error as e:
+        raise ValueError(f"{where}: expect is not a regular expression: {e}") from None
+    step.update(compare=cmp, target=str(target) if cmp == "equals" else target, expect=s.get("expect"),
+                cooldown=seconds(s.get("cooldown", 0), f"{where}: cooldown"), flap_max=int(s.get("flap_max", 0)),
+                flap_window=seconds(s.get("flap_window", 3600), f"{where}: flap_window"))
+    if step["timeout"] is None:
+        step["timeout"] = 60.0  # a watch reads a network source: a hung curl must not hold the locks
+    return step
 
 
 def normalize(jid, j) -> dict:
@@ -196,9 +235,11 @@ def normalize(jid, j) -> dict:
     for name in j.get("lock", []):  # a lock name is a file name under <state>/locks
         if not file_name_ok(name):
             raise ValueError(f"job {jid}: lock name {name!r}: use letters, digits, - and _, and no Windows device name")
-    steps = [_norm_step(s, f"step{i + 1}") for i, s in enumerate(j.get("step", []))]
+    steps = [_norm_step(s, f"step{i + 1}", jid) for i, s in enumerate(j.get("step", []))]
     if "command" in j:
-        steps = [_norm_step(j, "main")]
+        steps = [_norm_step({**j, "id": "main"}, "main", jid)]
+    if len({s["id"] for s in steps}) != len(steps):  # a watch keeps its state under the step id
+        raise ValueError(f"job {jid}: two steps have the same id")
     if not steps:
         raise ValueError(f"job {jid}: no command or step")
     job = {"id": jid, "schedule": j.get("schedule"), "run_at_load": bool(j.get("run_at_load")),
@@ -206,7 +247,12 @@ def normalize(jid, j) -> dict:
            "after": list(j.get("after", [])), "needs": list(j.get("needs", [])),
            "wants": list(j.get("wants", [])), "bundle": j.get("bundle"),
            "lock_timeout": int(j.get("lock_timeout", 900)), "replaces": list(j.get("replaces", [])),
-           "on_event": j.get("on_event"), "steps": steps}
+           "on_event": j.get("on_event"), "notify": j.get("notify"),
+           "notify_after": int(j.get("notify_after", 1)), "steps": steps}
+    if job["notify"] is not None and not (isinstance(job["notify"], str) and NOTIFY_RE.fullmatch(job["notify"])):
+        raise ValueError(f"job {jid}: notify is ntfy://<topic> or an https:// URL")
+    if job["notify_after"] < 1:
+        raise ValueError(f"job {jid}: notify_after must be 1 or more")
     for n in job["needs"] + job["wants"]:  # "kind:arg", or a command as an argv list that passes on exit 0
         if not (isinstance(n, str) or (isinstance(n, list) and n and all(isinstance(x, str) for x in n))):
             raise ValueError(f"job {jid}: a need is \"kind:arg\" or an argv list, not {n!r}")
@@ -280,12 +326,16 @@ def toml_job(j) -> str:
         out.append(f"bundle = {toml_val(j['bundle'])}")
     if j["lock_timeout"] != 900:
         out.append(f"lock_timeout = {j['lock_timeout']}")
+    if j.get("notify"):
+        out.append(f"notify = {toml_val(j['notify'])}")
+    if j.get("notify_after", 1) != 1:
+        out.append(f"notify_after = {j['notify_after']}")
     single = len(j["steps"]) == 1 and j["steps"][0]["id"] == "main"
     for s in j["steps"]:
         if not single:
             out += ["", f"[[{base}.step]]", f"id = {toml_val(s['id'])}"]
         for k in STEP_KEYS:
-            if s.get(k):
+            if s.get(k) not in (None, "", []):  # a target of 0 is a value
                 out.append(f"{k} = {toml_val(s[k])}")
     return "\n".join(out) + "\n"
 
@@ -528,23 +578,76 @@ def _open_log(path):
     return open(p, "ab")
 
 
+def watch_value(step, text):
+    """A watch step's stdout -> (value, None), or (None, why it is not a reading). A broken read
+    is a failed step and is never compared, so an expired token or an error page is not a change."""
+    out = text.strip()
+    if not out:
+        return None, "empty output"
+    if step["expect"] and not re.search(step["expect"], out):
+        return None, f"output does not match expect: {out[:60]!r}"
+    if step["compare"] in ("above", "below"):
+        try:
+            float(out)
+        except ValueError:
+            return None, f"not a number: {out[:60]!r}"
+    if step["compare"] == "new-items":
+        return "\n".join(dict.fromkeys(ln.strip() for ln in out.splitlines() if ln.strip())), None
+    return out, None
+
+
+def kill_tree(pid):
+    """End a timed-out step and everything it started (a hung curl under sh). The step stays in
+    the wrapper's process group, so launchd still ends it with the wrapper; this walks the
+    children instead. ponytail: a child started between the ps and the kill survives."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, **NO_WINDOW)
+        return
+    kids = {}
+    try:
+        for ln in subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True, text=True).stdout.splitlines():
+            c, par = map(int, ln.split())
+            kids.setdefault(par, []).append(c)
+    except (OSError, ValueError):
+        pass
+    todo = [pid]
+    while todo:
+        q = todo.pop()
+        todo += kids.get(q, [])
+        try:
+            os.kill(q, 9)  # SIGKILL; signal.SIGKILL does not exist on Windows
+        except OSError:
+            pass
+
+
 def run_step(step):
     t0 = time.time()
     rec = {"id": step["id"], "exit": None, "failed": [], "note": None}
     out_f = err_f = None
-    cap = step["report"] == "json-failed-sources"
+    cap, broken = step["report"] is not None, False
     try:
         out_f = _open_log(step["stdout"])
         err_f = _open_log(step["stderr"])
-        r = subprocess.run(step["command"], stdout=subprocess.PIPE if cap else (out_f or None),
-                           stderr=err_f or None, **NO_WINDOW, **inherit_locks())
-        rec["exit"] = r.returncode
+        p = subprocess.Popen(step["command"], stdout=subprocess.PIPE if cap else (out_f or None),
+                             stderr=err_f or None, **NO_WINDOW, **inherit_locks())
+        try:
+            out, _ = p.communicate(timeout=step.get("timeout"))
+        except subprocess.TimeoutExpired:
+            kill_tree(p.pid)
+            out, _ = p.communicate()
+            broken, rec["note"] = True, f"timed out after {step['timeout']:g}s"
+        rec["exit"] = p.returncode
         if cap:
-            text = r.stdout.decode(errors="replace")
             if out_f:
-                out_f.write(r.stdout)
-            rec["failed"], code = yaams_failed(text)
-            rec["note"] = code
+                out_f.write(out)
+            text = out.decode(errors="replace")
+            if broken:
+                pass
+            elif step["report"] == "json-failed-sources":
+                rec["failed"], rec["note"] = yaams_failed(text)
+            elif rec["exit"] == 0:
+                rec["_value"], why = watch_value(step, text)
+                broken, rec["note"] = why is not None, why
     except OSError as e:
         rec["exit"], rec["note"] = 127, f"{e.filename or step['command'][0]}: {e.strerror}"
     finally:
@@ -552,7 +655,7 @@ def run_step(step):
             if f:
                 f.close()
     rec["duration_s"] = round(time.time() - t0, 2)
-    rec["status"] = "partial" if rec["failed"] else ("ok" if rec["exit"] == 0 else "failed")
+    rec["status"] = "partial" if rec["failed"] else ("ok" if rec["exit"] == 0 and not broken else "failed")
     return rec
 
 
@@ -571,6 +674,160 @@ def _execute(job, slot, trigger, pulled_by, pre):
     return {"id": job["id"], "slot": slot.isoformat(), "trigger": trigger, "pulled_by": pulled_by,
             "started": started, "duration_s": round(time.time() - t0, 2), "status": st,
             "exit": 0 if st == "ok" else 1, "steps": steps, "preflight": pre}
+
+
+# -------------------------------------------------------------- watch, notify
+
+BAD = ("failed", "partial", "skipped", "lock-timeout")
+# new-items forgets the oldest told items past this. ponytail: an item that is still printed after
+# ITEMS_MAX newer ones is told again; keep a last-seen time per item if a source ever prints that many
+ITEMS_MAX = 10000
+
+
+def short(v, n=80):
+    v = (v or "").replace("\n", " | ")
+    return v if len(v) <= n else v[:n - 1] + "…"
+
+
+def in_state(step, value):
+    if value is None:
+        return False
+    if step["compare"] == "above":
+        return float(value) > step["target"]
+    if step["compare"] == "below":
+        return float(value) < step["target"]
+    return value == step["target"]  # equals
+
+
+def watch(step, st, value, now, send):
+    """Compare one good reading with what the user was last told. st is this step's saved state,
+    changed in place. -> the step note. Edge-triggered: a value that stays changed, or stays over a
+    threshold, is told once. Cooldown defers a notice without losing it. More than flap_max moves
+    inside flap_window become one digest at the end of the window."""
+    first = "last" not in st
+    cooled = st.get("told_at") is None or now - st["told_at"] >= step["cooldown"]
+    if step["compare"] == "new-items":
+        items = st.setdefault("items", {})  # item -> told, in the order first seen; a new watch seeds silently
+        for i in value.splitlines():
+            items.setdefault(i, first)
+        st["last"] = "seen"
+        pending = [i for i, told in items.items() if not told]
+        for i in [i for i, told in items.items() if told][:max(0, len(items) - ITEMS_MAX)]:
+            del items[i]
+        if not pending:
+            return "baseline" if first else "no new items"
+        if not cooled:
+            return f"{len(pending)} new, cooldown"
+        more = f"\n… and {len(pending) - 10} more" if len(pending) > 10 else ""
+        if not send(f"{len(pending)} new:\n" + "\n".join(pending[:10]) + more):
+            return f"{len(pending)} new, notify failed"
+        for i in pending:
+            items[i] = True
+        st["told_at"] = now
+        return f"{len(pending)} new"
+    changed = step["compare"] == "changed"
+    if first:
+        # `changed` seeds silently: a new watch must not fire on install. A threshold seeds as "not
+        # in state", so a value already over the line on the first read is told once.
+        st.update(last=value, told=value, told_in=False, moves=[])
+        if changed:
+            return "baseline"
+    last = None if first else st["last"]
+    moved = not first and (value != last if changed else in_state(step, value) != in_state(step, last))
+    st["last"] = value
+    st["moves"] = [t for t in st.get("moves", []) + ([now] if moved else []) if t > now - step["flap_window"]]
+    if st.get("flap_until") is None and moved and step["flap_max"] and len(st["moves"]) > step["flap_max"]:
+        st.update(flap_until=now + step["flap_window"], flap_from=st["told"])  # entering needs a real move
+        return "flapping"
+    if st.get("flap_until") is not None:
+        if now < st["flap_until"]:
+            return "flapping"
+        if not send(f"moved {len(st['moves'])} times in {step['flap_window'] / 60:g} min; "
+                    f"was {short(st['flap_from'])}, now {short(value)}"):
+            return "flapping, notify failed"
+        st.update(told_at=now, told=value, told_in=not changed and in_state(step, value), flap_until=None, flap_from=None)
+        return "flap digest"
+    if changed:
+        want, text = value != st["told"], f"{short(st['told'])} -> {short(value)}"
+    else:
+        now_in = in_state(step, value)
+        if not now_in:
+            st["told_in"] = False  # re-arm silently
+        want = now_in and not st["told_in"]
+        text = (f"{short(value)} is {step['compare']} {step['target']:g}" if step["compare"] != "equals"
+                else f"value is now {short(value)}")
+    if not want:
+        return "no change" if changed else ("in state" if st["told_in"] else "not in state")
+    if not cooled:
+        return f"{text}, cooldown"
+    if not send(text):
+        return f"{text}, notify failed"
+    st.update(told_at=now, told=value, told_in=not changed)
+    return text
+
+
+def deliver(url, title, text):
+    """POST one notice. ntfy://topic is https://ntfy.sh/topic. -> None, or why it failed."""
+    if url.startswith("ntfy://"):
+        url = "https://ntfy.sh/" + url[len("ntfy://"):]
+    req = urllib.request.Request(url, data=text.encode("utf-8"), method="POST",
+                                 headers={"Title": title.encode("ascii", "replace").decode()})
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+        return None
+    except (OSError, ValueError) as e:
+        return str(e)[:200]
+
+
+DELIVER = [deliver]  # the self-check swaps this; nothing else does
+
+
+def finish(job, rec, state, now=None, say=print):
+    """Write the record of a run, after the watch steps and the failure streak have had their say.
+    Nothing is sent without `notify`; the notes still show what would have been told. A notice that
+    fails to send is kept and sent by a later run."""
+    now = (now or datetime.now()).timestamp()
+    sent, errors = [], []
+
+    def send(text):
+        if not job.get("notify"):
+            return True  # told in the note only
+        if err := DELIVER[0](job["notify"], f"takt {self_name()}: {job['id']}", text):
+            errors.append(err)
+            return False
+        sent.append(short(text, 200))
+        return True
+
+    try:
+        with Locks(state, [job["id"]], 30, sub="notify"):  # also a lock-timeout run writes this state
+            f = state / "notify" / f"{job['id'].lower()}.json"
+            try:
+                ns = json.loads(f.read_text())
+            except (OSError, ValueError):
+                ns = {}
+            bad = rec["status"] in BAD
+            fails = ns.get("fails", 0) + 1 if bad else 0
+            if bad and fails >= job.get("notify_after", 1) and not ns.get("alerted"):
+                ns["alerted"] = send(f"{rec['status']}: {detail_of(rec) or rec.get('note') or 'no detail'}")
+            elif not bad and ns.get("alerted"):
+                ns["alerted"] = not send(f"ok again after {ns.get('fails', 0)} bad runs")
+            ns["fails"] = fails
+            for s, js in zip(rec["steps"], job["steps"]):
+                if "_value" in s and s["status"] == "ok":
+                    s["note"] = watch(js, ns.setdefault("steps", {}).setdefault(js["id"], {}), s["_value"], now, send)
+            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(ns) + "\n")
+            os.replace(tmp, f)
+    except TimeoutError:
+        errors.append("notify state is locked by another run")
+    for s in rec["steps"]:
+        s.pop("_value", None)
+    if sent:
+        rec["sent"] = sent
+    if errors:
+        rec["notify_error"] = errors[0]
+        say(f"{job['id']}: notify failed, a later run retries: {errors[0]}")
+    write_record(state, rec)
 
 
 def slot_of(job, now):
@@ -738,7 +995,7 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
                "started": datetime.now().isoformat(timespec="seconds"), "duration_s": 0,
                "status": "lock-timeout", "exit": 75, "steps": [], "preflight": preflight(job),
                "note": f"lock {e} held for more than {job['lock_timeout']}s"}
-        write_record(state, rec)
+        finish(job, rec, state, now, say)
         say(f"{jid}: lock-timeout ({rec['note']})")
         return 75
     try:
@@ -757,19 +1014,19 @@ def run_job(spec, jid, state: Path, now=None, scheduled=False, dry=False, say=pr
             if dslot and dslot >= slot and not late and not (lr and lr.get("slot") == dslot.isoformat()):
                 order.append((d, dslot))
         for d, dslot in order:
-            code = _run_locked(spec[d], dslot, "pulled", jid, state, say)
+            code = _run_locked(spec[d], dslot, "pulled", jid, state, say, now=now)
             say(f"{jid}: pulled in {d} first (exit {code})")
         # preflight now, after the locks and the dependencies: a dependency may be what
         # makes a `needs` check pass (a token refresh before the job that needs the token)
         rec_code = _run_locked(job, slot, trig, None, state, say, waited=locks.waited,
-                               blocked_on=locks.blocked_on, pulled=[d for d, _ in order])
+                               blocked_on=locks.blocked_on, pulled=[d for d, _ in order], now=now)
     finally:
         locks.__exit__()
         marker.__exit__()
     return rec_code
 
 
-def _run_locked(job, slot, trig, pulled_by, state, say, waited=0, blocked_on=None, pulled=(), pre=None):
+def _run_locked(job, slot, trig, pulled_by, state, say, waited=0, blocked_on=None, pulled=(), pre=None, now=None):
     pre = preflight(job) if pre is None else pre
     failed = [r for r in pre if r["hard"] and not r["ok"]]
     if failed:
@@ -777,12 +1034,12 @@ def _run_locked(job, slot, trig, pulled_by, state, say, waited=0, blocked_on=Non
                "started": datetime.now().isoformat(timespec="seconds"), "duration_s": 0,
                "status": "skipped", "exit": 2, "steps": [], "preflight": pre,
                "note": "skipped: " + "; ".join(f"needs {r['need']} ({r['detail']})" for r in failed)}
-        write_record(state, rec)
+        finish(job, rec, state, now, say)
         say(f"{job['id']}: {rec['note']}")
         return 2
     rec = _execute(job, slot, trig, pulled_by, pre)
     rec["waited_s"], rec["blocked_on"], rec["pulled_in"] = waited, blocked_on, list(pulled)
-    write_record(state, rec)
+    finish(job, rec, state, now, say)
     say(f"{job['id']}: {rec['status']} in {rec['duration_s']}s (waited {waited}s)")
     return rec["exit"]
 
@@ -1467,6 +1724,8 @@ def detail_of(r):
             detail.append(f"warn {p['need']}: {p['detail']}")
     if r.get("waited_s", 0) >= 1:
         detail.append(f"waited {r['waited_s']}s on lock {r.get('blocked_on')}")
+    if r.get("notify_error"):
+        detail.append(f"notify failed: {r['notify_error']}")
     return "; ".join(detail)
 
 
@@ -1506,6 +1765,10 @@ def format_record(jid, r):
         out.append(f"  step {s.get('id', ''):14} {s.get('status', ''):8} exit {s.get('exit')}  {s.get('duration_s')}s"
                    + (f"  failed: {', '.join(s['failed'])}" if s.get("failed") else "")
                    + (f"  note: {s['note']}" if s.get("note") else ""))
+    for t in r.get("sent", []):
+        out.append(f"  sent: {t}")
+    if r.get("notify_error"):
+        out.append(f"  notify failed: {r['notify_error']}")
     for p in r.get("preflight", []):
         out.append(f"  {'needs' if p.get('hard') else 'wants'} {p.get('need', ''):12} "
                    f"{'ok' if p.get('ok') else 'MISSING'}  {p.get('detail', '')}")
@@ -2567,6 +2830,7 @@ def self_check():
         check_pub_review1(ok, tmp)
         check_pub_review2(ok, tmp)
         check_pub_review3(ok, tmp)
+        check_watch(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -4233,6 +4497,160 @@ def check_windows_last(ok):
     helper = subprocess.Popen([PY, "-c", "import time; time.sleep(30)"], **NO_WINDOW)
     end_job_leftovers()
     ok(helper.poll() is not None, "windows: a step's leftover is ended, and awaited, before the locks are released")
+
+
+def check_watch(ok, tmp):
+    """kikar's watcher, as a step: edge, thresholds, cooldown, flap digest, failure never read as a
+    change, delivery retry, new-items. Runs real wrappers in this process against a fake clock and a
+    fake sender."""
+    d = tmp / "watch"
+    d.mkdir()
+    st, sent, fail = d / "st", [], {"err": None}
+    real = DELIVER[0]
+    DELIVER[0] = lambda url, title, text: (sent.append((title.rsplit(": ", 1)[-1], text)), fail["err"])[1]
+    T = datetime(2026, 10, 7, 12, 0)
+    rd = [PY, "-c", "import sys;sys.stdout.write(open(sys.argv[1], encoding='utf-8').read())"]
+
+    def run(j, at):
+        run_job({j["id"]: j}, j["id"], st, now=T + timedelta(seconds=at), say=lambda *a: None)
+        return read_record(st, j["id"])
+
+    def watcher(jid, **kw):
+        vf = d / f"{jid}.v"
+        kw.setdefault("notify", "ntfy://t")
+        j = mkjob(jid, command=rd + [str(vf)], report="watch", **kw)
+
+        def tick(at, value=None):
+            if value is not None:
+                vf.write_text(value, encoding="utf-8")
+            r = run(j, at)
+            return r["steps"][0]["note"] if r["status"] == "ok" else r["status"]
+        return j, tick
+
+    told = lambda jid: [t for k, t in sent if k == jid]
+    try:
+        # 1. edge: a new watch seeds silently, one notice per change, none while it stays
+        _, tick = watcher("edge")
+        ok(tick(0, "A") == "baseline", "watch: first read seeds silently")
+        [tick(60 * i) for i in range(1, 6)]
+        ok(told("edge") == [], "watch: no notice without a change")
+        ok(tick(360, "B") == "A -> B" and told("edge") == ["A -> B"], "watch: a change is told")
+        [tick(60 * i) for i in range(7, 12)]
+        ok(len(told("edge")) == 1 and tick(720) == "no change", "watch: a changed value is told once (edge, not level)")
+        # 2. thresholds: told on entering the state, re-armed on leaving it
+        _, tick = watcher("thr", compare="above", target=10)
+        notes = [tick(60 * i, v) for i, v in enumerate(["5", "12", "15", "20", "8", "11", "11"])]
+        ok(len(told("thr")) == 2 and notes[3] == "in state", f"watch: above 10 told twice over 7 reads: {notes}")
+        _, tick = watcher("hot", compare="above", target=10)
+        tick(0, "50")
+        ok(told("hot") == ["50 is above 10"], "watch: a value over the line at install is told once")
+        # 3. cooldown defers without losing, and A -> B -> A inside it is nothing
+        _, tick = watcher("cool", cooldown="30m")
+        tick(0, "1"), tick(60, "2")
+        ok(tick(120, "3").endswith("cooldown") and len(told("cool")) == 1, "watch: cooldown holds a second notice")
+        tick(60 + 1800)
+        ok(told("cool")[-1:] == ["2 -> 3"], f"watch: a change held by cooldown is told after it: {told('cool')}")
+        tick(1900, "4"), tick(1960, "3"), tick(60 + 3600 + 60)
+        ok(len(told("cool")) == 2, "watch: A -> B -> A inside cooldown is not told")
+        # 4. flap: past flap_max moves in the window, one digest at its end
+        _, tick = watcher("flap", flap_window="10m", flap_max=3)
+        tick(0, "up")
+        notes = [tick(60 * i, "down" if i % 2 else "up") for i in range(1, 9)]
+        ok(len(told("flap")) == 3 and "flapping" in notes, f"watch: 3 notices, then flapping: {notes}")
+        [tick(60 * i, "down") for i in range(9, 30)]
+        dg = told("flap")[3:]
+        ok(len(dg) == 1 and "now down" in dg[0], f"watch: exactly one digest with where it landed: {dg}")
+        # 5. failure is never change: each kind fails the step, keeps the last value, alerts once
+        #    after notify_after bad runs, and once more when it is back
+        bad = {"nonzero": ([PY, "-c", "print('B');raise SystemExit(3)"], {}),
+               "timeout": ([PY, "-c", "import time;time.sleep(5);print('B')"], {"timeout": 0.5}),
+               "empty": ([PY, "-c", "pass"], {}), "blank": ([PY, "-c", "print('  \\n')"], {}),
+               "garbled": ([PY, "-c", "print('<html>502</html>')"], {"expect": "^[A-Z]$"})}
+        for kind, (cmd, kw) in bad.items():
+            jid = f"fail-{kind}"
+            good, tick = watcher(jid, notify_after=2, expect=kw.get("expect"))
+            broken = mkjob(jid, command=cmd, report="watch", notify="ntfy://t", notify_after=2, **kw)
+            tick(0, "A")
+            outs = [run(broken, 60)["status"]]
+            ok(told(jid) == [], f"watch {kind}: no alert after 1 bad run with notify_after = 2")
+            outs.append(run(broken, 120)["status"])
+            last = json.loads((st / "notify" / f"{jid}.json").read_text())["steps"]["main"]["last"]
+            ok(outs == ["failed", "failed"] and last == "A", f"watch {kind}: a failed read, last value kept: {outs} {last!r}")
+            ok(len(told(jid)) == 1 and told(jid)[0].startswith("failed:"), f"watch {kind}: one alert after 2 bad runs: {told(jid)}")
+            ok(tick(180) == "no change" and told(jid)[1:] == ["ok again after 2 bad runs"],
+               f"watch {kind}: one recovery notice, same value is no change: {told(jid)}")
+            run(broken, 240), run(broken, 300)
+            ok(sum(t.startswith("failed:") for t in told(jid)) == 2, f"watch {kind}: a second outage is told again")
+        _, tick = watcher("nan", compare="below", target=3)
+        tick(0, "7")
+        ok(tick(60, "n/a") == "failed" and len(told("nan")) == 1, "watch: below reads a non-number as a failure")
+        # 6. a failed delivery does not move what the user was told; a later run sends it
+        _, tick = watcher("deliv")
+        tick(0, "X")
+        fail["err"] = "ntfy down"
+        ok(tick(60, "Y").endswith("notify failed") and read_record(st, "deliv")["notify_error"] == "ntfy down",
+           "watch: a failed delivery is recorded")
+        fail["err"] = None
+        ok(tick(120) == "X -> Y" and read_record(st, "deliv")["sent"] == ["X -> Y"], "watch: a failed delivery is retried")
+        # 7. new-items: only lines never seen before, in the order they came; cooldown keeps them
+        _, tick = watcher("items", compare="new-items")
+        ok(tick(0, "c3\nc2\nc1\n") == "baseline" and tick(60) == "no new items", "new-items: seeds silently")
+        tick(120, "c5\nc4\nc3\nc2\n"), tick(180)
+        ok(told("items") == ["2 new:\nc5\nc4"], f"new-items: told once, only the new lines: {told('items')}")
+        _, tick = watcher("icool", compare="new-items", cooldown="1h")
+        tick(0, "a1\n"), tick(60, "a2\na1\n")
+        ok(tick(120, "a3\na2\n").endswith("cooldown"), "new-items: cooldown holds")
+        tick(180, "a4\na3\n"), tick(60 + 3600, "a5\na4\n")
+        ok(told("icool") == ["1 new:\na2", "3 new:\na3\na4\na5"], f"new-items: an item off the page in cooldown is kept: {told('icool')}")
+        # 8. any job: notify on failure, once per bad streak, and on recovery; nothing without notify
+        flag = d / "fail.flag"
+        cmd = [PY, "-c", "import os,sys;sys.exit(1 if os.path.exists(sys.argv[1]) else 0)", str(flag)]
+        j = mkjob("plain", command=cmd, notify="https://hooks.example/x")
+        flag.write_text("")
+        run(j, 0), run(j, 60)
+        flag.unlink()
+        run(j, 120), run(j, 180)
+        ok(told("plain") == ["failed: main: failed exit 1", "ok again after 2 bad runs"], f"notify: one alert per bad streak, one recovery: {told('plain')}")
+        n = len(sent)
+        flag.write_text("")
+        run(mkjob("quiet", command=cmd), 0)
+        ok(len(sent) == n and not read_record(st, "quiet").get("sent"), "notify: nothing is sent without notify")
+        run(mkjob("skip", needs=["exe:takt-no-such-binary"], notify="ntfy://t"), 0)
+        ok(len(told("skip")) == 1 and told("skip")[0].startswith("skipped:"), "notify: a skipped job is told")
+        # 9. a timeout ends the step and what it started (POSIX: the grandchild too)
+        pidf = d / "pid"
+        cmd = ([PY, "-c", "import time;time.sleep(30)"] if os.name == "nt"
+               else ["/bin/sh", "-c", f"sleep 30 & echo $! > {pidf}; wait"])
+        t0 = time.time()
+        r = run(mkjob("hang", command=cmd, timeout=0.5), 0)
+        ok(r["status"] == "failed" and r["steps"][0]["note"] == "timed out after 0.5s" and time.time() - t0 < 10,
+           f"timeout: the step is failed and named: {r['steps'][0]}")
+        if os.name != "nt":
+            pid, alive = int(pidf.read_text()), True
+            for _ in range(40):
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.05)
+                except OSError:
+                    alive = False
+                    break
+            ok(not alive, "timeout: the step's child is ended too")
+        # 10. the spec: bad watch config is refused, durations parse, a watch round-trips
+        for kw in ({"report": "watch", "compare": "sometimes"}, {"report": "watch", "compare": "above"},
+                   {"report": "watch", "compare": "equals"}, {"report": "watch", "cooldown": "soon"},
+                   {"report": "watch", "expect": "("}, {"compare": "changed"}, {"report": "bogus"},
+                   {"notify": "smtp://me"}, {"notify_after": 0},
+                   {"step": [{"id": "a", "command": ["true"]}, {"id": "a", "command": ["true"]}]}):
+            try:
+                mkjob("bad", **kw)
+                ok(False, f"spec: accepted {kw}")
+            except ValueError:
+                ok(True, "")
+        ok(seconds("10m", "") == 600 and seconds("1.5h", "") == 5400 and seconds(90, "") == 90, "spec: durations")
+        w = mkjob("rt", command=["x"], report="watch", compare="below", target=0, cooldown="5m", notify="ntfy://t", notify_after=3)
+        ok(load_spec(write_spec(d, w))["rt"] == w, "spec: a watch job round-trips through TOML")
+    finally:
+        DELIVER[0] = real
 
 
 def check_examples(ok, tmp):
