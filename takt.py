@@ -24,6 +24,7 @@ Docs: https://github.com/damsleth/takt/tree/main/docs
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import ipaddress
 import json
@@ -1736,6 +1737,35 @@ def parse_native(be, text, ids, agents_dir: Path):
     return out
 
 
+def schtasks_text(run=subprocess.run):
+    """Task Scheduler without CIM. Some managed hosts refuse Get-ScheduledTask from any PowerShell
+    a process starts ("Cannot connect to CIM server. Access denied", kswon). The CSV list gives the
+    task names, and each task's XML gives <Settings><Enabled>; neither is localized text.
+    -> the same name|State lines as the PowerShell query, or None if schtasks cannot answer."""
+    kw = dict(capture_output=True, text=True, timeout=30, **NO_WINDOW)
+
+    def call(argv):  # an OSError or a timeout is "cannot answer", like a non-zero exit
+        try:
+            return run(argv, **kw)
+        except (OSError, subprocess.SubprocessError):
+            return subprocess.CompletedProcess(argv, 1, "", "")
+    r = call(["schtasks", "/Query", "/FO", "CSV", "/NH"])
+    if r.returncode:
+        return None
+    names = sorted({row[0][6:] for row in csv.reader(r.stdout.splitlines()) if row and row[0].lower().startswith("\\takt\\")})
+    out = []
+    for n in names:
+        x = call(["schtasks", "/Query", "/TN", f"\\takt\\{n}", "/XML"])
+        if x.returncode:
+            return None
+        try:  # an encoding declaration in a str is refused by the parser, so drop it
+            en = ET.fromstring(re.sub(r"^\s*<\?xml[^>]*\?>", "", x.stdout)).find(f"{{{TS_NS}}}Settings/{{{TS_NS}}}Enabled")
+        except (ET.ParseError, ValueError):
+            return None
+        out.append(f"{n}|{'Disabled' if en is not None and (en.text or '').strip().lower() == 'false' else 'Ready'}")
+    return "".join(f"{x}\n" for x in out)
+
+
 def native_text(be, ids, strict=False, run=subprocess.run):
     """The scheduler's own list of jobs. `status` tolerates a failed query. A plan that changes
     the scheduler passes strict=True: there, "the query failed" must never read as "nothing is
@@ -1747,6 +1777,8 @@ def native_text(be, ids, strict=False, run=subprocess.run):
         if strict:
             raise RuntimeError(f"cannot read the scheduler ({q[0]}): {e}") from e
         return ""
+    if be == "schtasks" and r.returncode != 0 and (alt := schtasks_text(run)) is not None:
+        return alt
     if strict and r.returncode != 0:
         raise RuntimeError(f"cannot read the scheduler: {q[0]} exited {r.returncode}: {(r.stderr or '').strip()[:200]}")
     return r.stdout
@@ -3634,6 +3666,29 @@ def check_review3(ok, tmp):
         except RuntimeError:
             ok(True, "")
     ok(native_text("schtasks", [], run=broken) == "", "status: a failed scheduler query still shows the table")
+    # kswon refuses Get-ScheduledTask (CIM access denied): schtasks' CSV list and XML stand in for it
+    xml = lambda on: (f'<?xml version="1.0" encoding="UTF-16"?>\n<Task xmlns="{TS_NS}"><Triggers><CalendarTrigger>'
+                      f'<Enabled>true</Enabled></CalendarTrigger></Triggers><Settings><Enabled>{on}</Enabled></Settings></Task>')
+
+    def nocim(argv, **k):
+        if argv[0] == "powershell":
+            return subprocess.CompletedProcess(argv, 1, "", "Cannot connect to CIM server. Access denied")
+        if argv[1:3] == ["/Query", "/FO"]:
+            return subprocess.CompletedProcess(argv, 0, '"\\takt\\a","N/A","Ready"\n"\\takt\\a","N/A","Ready"\n'
+                                                       '"\\takt\\b","N/A","Disabled"\n"\\Other\\x","N/A","Ready"\n', "")
+        return subprocess.CompletedProcess(argv, 0, xml("false" if argv[3].endswith("\\b") else "true"), "")
+    text = native_text("schtasks", [], True, nocim)
+    ok(text == "a|Ready\nb|Disabled\n" and parse_native("schtasks", text, ["a", "b"], tmp) == {"a": (True, True), "b": (True, False)},
+       f"native: without CIM, schtasks lists the takt tasks and reads Settings/Enabled: {text!r}")
+    ok(inventory({"a": mkjob("a")}, "schtasks", tmp, nocim) is not None, "native: a plan reads the scheduler through the fallback")
+
+    def nocsv(argv, **k):
+        return subprocess.CompletedProcess(argv, 1, "", "denied")
+    try:
+        native_text("schtasks", [], True, nocsv)
+        ok(False, "native: a failed fallback must not read as no tasks")
+    except RuntimeError:
+        ok(True, "")
 
     # uninstall and retirement stop running work: the systemd service, the running Windows task
     nat = {"old": (True, True)}
