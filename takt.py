@@ -679,6 +679,10 @@ def run_step(step):
         except subprocess.TimeoutExpired:
             kill_tree(p.pid)
             try:
+                p.kill()  # by its handle: a host whose policy refuses taskkill ("Access denied", kswon) still ends the step
+            except OSError:
+                pass
+            try:
                 out, _ = p.communicate(timeout=DRAIN_S)
             except subprocess.TimeoutExpired:  # a child that left the tree (its parent exited) holds the pipe
                 if p.stdout:
@@ -4768,6 +4772,14 @@ def check_watch(ok, tmp):
                     alive = False
                     break
             ok(not alive, "timeout: the step's child is ended too")
+        # 9b. a tree kill that ends nothing (taskkill refused on a managed Windows host) still ends the step
+        tree, t0 = kill_tree, time.time()
+        globals()["kill_tree"] = lambda pid: None
+        try:
+            r = run(mkjob("refused", command=[PY, "-c", "import time;time.sleep(30)"], timeout=0.5), 0)
+        finally:
+            globals()["kill_tree"] = tree
+        ok(r["status"] == "failed" and time.time() - t0 < 10, f"timeout: the step ends when the tree kill is refused ({time.time() - t0:.1f}s)")
         # 10. the spec: bad watch config is refused, durations parse, a watch round-trips
         for kw in ({"report": "watch", "compare": "sometimes"}, {"report": "watch", "compare": "above"},
                    {"report": "watch", "compare": "equals"}, {"report": "watch", "cooldown": "soon"},
