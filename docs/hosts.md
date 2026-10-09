@@ -54,6 +54,8 @@ A host named in `[settings] web` also gets a web service from `install`. The oth
 - Tasks run with `pythonw.exe`, and each step starts without a window, so no console window opens.
 - The wrapper runs in a job object, so `schtasks /End` and `uninstall` end its steps too. If takt cannot create the job object, the job does not run, and its record says why.
 - Use argv lists for commands. A string command runs through `/bin/sh -c`, which Windows does not have.
+- A managed machine can refuse `Get-ScheduledTask` ("Cannot connect to CIM server. Access denied") and `taskkill` ("Access denied"). takt then reads the `\takt\` tasks with `schtasks /Query` (the CSV list and the XML of each task, which are not localized), and ends a timed-out step through its own process handle.
+- If the Python installer fails over ssh with `0x80070641` (no Windows Installer service in an ssh session), unpack the official CPython package from nuget.org (`https://www.nuget.org/api/v2/package/python/<version>`, the `tools` folder) into `%LOCALAPPDATA%\Programs\Python\Python3xx`. Then set `[settings] python` to its `python.exe`.
 
 ## Differences between schedulers
 
