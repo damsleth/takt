@@ -22,6 +22,9 @@ stderr = "~/.local/state/takt/backup.err"
 | `status` | Where job statuses show: `master` (default), `all`, `client` or `none`. See [Status across devices](cli.md#status-across-devices). Set it on the controller. |
 | `master` | The device that shows all statuses in `master` mode. Default: the controller. |
 | `name` | The name of this device in the takt-net. Default: its short host name. |
+| `notify_token` | The path of a file that holds a bearer token for `notify`, for example a token for your own ntfy server. takt reads the file at each send and sends `Authorization: Bearer <token>`. Make the file readable only by you. |
+| `update` | `true` (default), `false`, or a cron schedule. See [Updates](#updates). |
+| `update_ref` | The branch or tag that `takt update` installs. Default: `main`. |
 | `path` | The `PATH` that launchd and systemd give to the job. Write it out in full. A copy of your shell `PATH` can hold temporary directories. |
 
 ## Job keys
@@ -120,6 +123,17 @@ A job with `notify` sends notices. A job without `notify` sends nothing: the not
 takt sends each notice as a POST. The body is the text, and the `Title` header is `takt <device>: <job id>`. `ntfy://<topic>` sends to `https://ntfy.sh/<topic>`. If a notice cannot be sent, takt records `notify_error` and does not mark the notice as sent. The next run sends it again. If a failure alert cannot be sent and the next run is `ok`, the recovery notice includes the failure. The record holds the notices that it sent in `sent`, and `takt show` lists them.
 
 `run --dry-run` sends nothing.
+
+## Updates
+
+Each jobs file gets one more job, `takt-update`, unless `[settings] update = false`. It runs `takt update` every hour at minute 7 (`update = "<cron>"` sets another schedule). `install` registers it with the other jobs, and `status` shows it.
+
+`takt update` fetches `takt.py` from GitHub at `settings.update_ref` (default `main`). If the file is the same, it does nothing. If it differs, takt runs the new file with `--version` and with `render` on this device's jobs file. Only if both succeed does it replace `takt.py`, in one step. A run that starts during the update reads the old file or the new file, never a part of one.
+
+- A `takt.py` in a git checkout is left to git, and the job records `ok`.
+- A copy that `push` put on a host from a branch is replaced by `main` at the next update. To test a branch on a host, set `update_ref` to that branch, or `update = false`, in that host's jobs file.
+- A job with the same id, `takt-update`, in your jobs file replaces the built-in one.
+- `update` replaces only `takt.py`. The scheduler files stay. If a new version writes them in a different form, run `install` again.
 
 ## Schedules
 

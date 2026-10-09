@@ -24,6 +24,7 @@ Docs: https://github.com/damsleth/takt/tree/main/docs
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import math
@@ -286,9 +287,35 @@ def read_toml(path) -> dict:
     return tomllib.loads(Path(path).read_text(encoding="utf-8"))  # TOML is UTF-8; a Windows locale default is not
 
 
+UPDATE_ID = "takt-update"
+UPDATE_SCHEDULE = "7 * * * *"  # hourly, clear of minute 0
+UPDATE_URL = "https://raw.githubusercontent.com/damsleth/takt/{ref}/takt.py"
+
+
+def update_job(cfg, spec_path):
+    """The job that every jobs file gets unless `[settings] update = false`: `takt update`, which
+    installs the takt.py on GitHub (settings.update_ref, default main) when it differs."""
+    sched = cfg.get("update", True)
+    sched = UPDATE_SCHEDULE if sched is True else sched
+    if not isinstance(sched, str):
+        raise ValueError("settings.update: a cron schedule, true, or false")
+    py = cfg.get("python") or (sys.executable if os.name == "nt" else shutil.which("python3") or sys.executable)
+    return normalize(UPDATE_ID, {"schedule": sched, "lock": ["takt-update"],
+                                 "command": [py, str(Path(__file__).resolve()), "update", "--spec",
+                                             str(Path(spec_path).resolve())]})
+
+
 def load_spec(path) -> dict:
     raw = read_toml(path)
+    cfg = raw.get("settings", {})
     spec = {jid: normalize(jid, j) for jid, j in raw.get("job", {}).items()}
+    if UPDATE_ID not in spec and cfg.get("update", True) is not False and not os.environ.get("TAKT_NO_UPDATE_JOB"):
+        spec[UPDATE_ID] = update_job(cfg, path)
+    if (tok := cfg.get("notify_token")) is not None:
+        if not isinstance(tok, str):
+            raise ValueError("settings.notify_token: the path of a file that holds the token")
+        for j in spec.values():
+            j["notify_token"] = tok
     if len({j.lower() for j in spec}) != len(spec):  # records, markers and units would share a file
         raise ValueError("two job ids differ only by case: " + ", ".join(sorted(spec)))
     for j in spec.values():
@@ -791,13 +818,16 @@ def watch(step, st, value, now, send):
     return text
 
 
-def deliver(url, title, text):
-    """POST one notice. ntfy://topic is https://ntfy.sh/topic. -> None, or why it failed."""
+def deliver(url, title, text, token=None):
+    """POST one notice. ntfy://topic is https://ntfy.sh/topic. token: the path of a file that holds
+    a bearer token (settings.notify_token); it is read at each send. -> None, or why it failed."""
     if url.startswith("ntfy://"):
         url = "https://ntfy.sh/" + url[len("ntfy://"):]
+    headers = {"Title": title.encode("ascii", "replace").decode()}
     try:
-        req = urllib.request.Request(url, data=text.encode("utf-8"), method="POST",
-                                     headers={"Title": title.encode("ascii", "replace").decode()})
+        if token:
+            headers["Authorization"] = "Bearer " + Path(os.path.expanduser(token)).read_text(encoding="utf-8").strip()
+        req = urllib.request.Request(url, data=text.encode("utf-8"), method="POST", headers=headers)
         urllib.request.urlopen(req, timeout=15).read()
         return None
     except (OSError, ValueError) as e:
@@ -817,7 +847,7 @@ def finish(job, rec, state, now=None, say=print):
     def send(text):
         if not job.get("notify"):
             return True  # told in the note only
-        if err := DELIVER[0](job["notify"], f"takt {self_name()}: {job['id']}", text):
+        if err := DELIVER[0](job["notify"], f"takt {self_name()}: {job['id']}", text, job.get("notify_token")):
             errors.append(err)
             return False
         sent.append(short(text, 200))
@@ -1880,6 +1910,61 @@ def push(host):
                                f"{host}:"]).returncode
 
 
+def git_checkout(p: Path):
+    return any((d / ".git").exists() for d in (p.parent, *p.parent.parents))
+
+
+def fetch_url(url):
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return r.read()
+
+
+def update_verify(path, spec_path):
+    """-> None when the new takt.py starts and can load and render this host's jobs file."""
+    run = lambda *a: subprocess.run([sys.executable, str(path), *a], capture_output=True, text=True,
+                                    timeout=120, **NO_WINDOW)
+    r = run("--version")
+    if r.returncode or not r.stdout.startswith("takt "):
+        return "does not start"
+    if spec_path and Path(spec_path).exists():
+        with tempfile.TemporaryDirectory() as t:
+            r = run("render", "--spec", str(spec_path), "--out", t)
+        if r.returncode:
+            return f"cannot load {spec_path}: {(r.stderr or r.stdout).strip()[-200:]}"
+    return None
+
+
+def update(spec_path, ref="main", force=False, fetch=fetch_url, script=None, say=print):
+    """Replace this takt.py with the one on GitHub at `ref`, once the new file has shown that it
+    starts and can load this host's jobs file. A copy in a git checkout is left to git. -> exit code."""
+    script = Path(script or __file__).resolve()
+    tag = lambda b: hashlib.sha256(b).hexdigest()[:10]
+    if git_checkout(script) and not force:
+        say(f"skipped: {script} is in a git checkout; update it with git pull")
+        return 0
+    try:
+        new = fetch(UPDATE_URL.format(ref=ref))
+    except (OSError, ValueError) as e:
+        say(f"update failed: cannot fetch {ref}: {e}")
+        return 1
+    old = script.read_bytes()
+    if new == old:
+        say(f"up to date ({tag(old)}, {ref})")
+        return 0
+    tmp = script.with_name(f".takt.{os.getpid()}.py")
+    try:
+        tmp.write_bytes(new)
+        if why := update_verify(tmp, spec_path):
+            say(f"update failed: the new takt.py ({tag(new)}) {why}; kept {tag(old)}")
+            return 1
+        os.chmod(tmp, script.stat().st_mode)
+        os.replace(tmp, script)  # atomic: a job that starts now reads the old file or the new one
+    finally:
+        tmp.unlink(missing_ok=True)
+    say(f"updated takt.py {tag(old)} -> {tag(new)} ({ref})")
+    return 0
+
+
 def stale_plan_note(host):
     """A dry-run `--host H install` pushes nothing, so H plans from its current jobs.toml. When the
     local jobs.<host>.toml declares other jobs, say so: that plan is not what --allow-writes installs."""
@@ -2652,6 +2737,10 @@ def build_parser():
     sub.add_parser("push", help="with --host H: copy takt.py and jobs.H.toml to H").add_argument(
         "--allow-writes", action="store_true")
     common(sub.add_parser("init", help="write a starter jobs.toml (never overwrites)"))
+    up = common(sub.add_parser("update", help="install the takt.py on GitHub (settings.update_ref, default main)"))
+    up.add_argument("-A", "--all-hosts", action="store_true", help="also every host with a jobs.<host>.toml")
+    up.add_argument("--ref", help="branch or tag (default: settings.update_ref, else main)")
+    up.add_argument("--force", action="store_true", help="also replace a takt.py in a git checkout")
     w = common(sub.add_parser("web", help="serve the dashboard to the tailnet (Tailscale address only)"))
     w.add_argument("--port", type=int, help=f"default settings.web_port, else {WEB_PORT}")
     w.add_argument("--bind", help="address to listen on (default: this device's Tailscale IPv4)")
@@ -2678,6 +2767,13 @@ def main(argv=None):
         sys.exit("push needs a host: takt --host <host> push --allow-writes")
     if a.cmd == "init":
         return init_spec(Path(a.spec))
+    if a.cmd == "update":
+        cfg = read_toml(a.spec).get("settings", {}) if Path(a.spec).exists() else {}
+        code = update(a.spec, a.ref or cfg.get("update_ref", "main"), a.force)
+        for h in (hosts()[1:] if a.all_hosts else []):
+            print(f"{h}:", flush=True)
+            code = on_host(h, ["update"] + (["--ref", a.ref] if a.ref else [])) or code
+        return code
     if a.cmd == "report":
         res = report_now(a.spec, state_dir(a))
         for h, r in res.items():
@@ -2829,6 +2925,7 @@ def self_check():
     global CONTAIN
     CONTAIN = False
     os.environ["TAKT_NO_REPORT"] = "1"  # wrappers spawned by the checks never report to a real web host
+    os.environ["TAKT_NO_UPDATE_JOB"] = "1"  # specs written by the checks hold only their own jobs; check_update tests it
     n = {"ok": 0, "bad": 0}
 
     def ok(cond, name):
@@ -2865,6 +2962,7 @@ def self_check():
         check_pub_review2(ok, tmp)
         check_pub_review3(ok, tmp)
         check_watch(ok, tmp)
+        check_update(ok, tmp)
         check_examples(ok, tmp)
         check_windows_last(ok)  # joins a kill-on-close job on Windows, so it runs last
     finally:
@@ -4542,7 +4640,7 @@ def check_watch(ok, tmp):
     st, sent, fail = d / "st", [], {"err": None}
     real = DELIVER[0]
     # records only what was delivered; fail["err"] makes the next sends fail
-    DELIVER[0] = lambda url, title, text: fail["err"] or sent.append((title.rsplit(": ", 1)[-1], text))
+    DELIVER[0] = lambda url, title, text, token=None: fail["err"] or sent.append((title.rsplit(": ", 1)[-1], text))
     T = datetime(2026, 10, 7, 12, 0)
     rd = [PY, "-c", "import sys;sys.stdout.write(open(sys.argv[1], encoding='utf-8').read())"]
 
@@ -4753,6 +4851,89 @@ def check_watch(ok, tmp):
            f"review: nan and inf are broken reads, the threshold stays armed: {notes} {told('finite')}")
     finally:
         DELIVER[0] = real
+
+
+def check_update(ok, tmp):
+    """The update job every jobs file gets, settings.notify_token, and `takt update`: it replaces the
+    file only when the new one starts and loads this host's jobs file, and it leaves a git checkout."""
+    d = tmp / "update"
+    d.mkdir()
+    spec = d / "jobs.toml"
+    old_env = os.environ.pop("TAKT_NO_UPDATE_JOB", None)
+    try:
+        spec.write_text('[settings]\npython = "/usr/bin/python3"\n\n[job.a]\ncommand = ["true"]\n')
+        j = load_spec(spec).get(UPDATE_ID)
+        ok(j and j["schedule"] == UPDATE_SCHEDULE and j["steps"][0]["command"][-3:] == ["update", "--spec", str(spec.resolve())]
+           and j["steps"][0]["command"][0] == "/usr/bin/python3", f"update: every jobs file gets the update job: {j and j['steps']}")
+        spec.write_text('[settings]\nupdate = false\n\n[job.a]\ncommand = ["true"]\n')
+        ok(UPDATE_ID not in load_spec(spec), "update: settings.update = false leaves it out")
+        spec.write_text('[settings]\nupdate = "30 3 * * *"\n\n[job.a]\ncommand = ["true"]\n')
+        ok(load_spec(spec)[UPDATE_ID]["schedule"] == "30 3 * * *", "update: settings.update sets its schedule")
+        spec.write_text('[job.takt-update]\nschedule = "0 5 * * *"\ncommand = ["mine"]\n')
+        ok(load_spec(spec)[UPDATE_ID]["steps"][0]["command"] == ["mine"], "update: a job of the same id in the file wins")
+        spec.write_text('[settings]\nupdate = 5\n\n[job.a]\ncommand = ["true"]\n')
+        try:
+            load_spec(spec)
+            ok(False, "update: settings.update = 5 accepted")
+        except ValueError:
+            ok(True, "")
+    finally:
+        if old_env is not None:
+            os.environ["TAKT_NO_UPDATE_JOB"] = old_env
+    # notify_token: every job gets the path, and deliver sends it as a bearer token, read at send time
+    tok = d / "ntfy.token"
+    tok.write_text("tk_test123\n")
+    spec.write_text(f'[settings]\nnotify_token = {json.dumps(str(tok))}\n\n[job.a]\ncommand = ["true"]\nnotify = "https://n.example/t"\n')
+    ok(load_spec(spec)["a"]["notify_token"] == str(tok), "notify_token: the jobs get it from settings")
+    seen, real_open = [], urllib.request.urlopen
+
+    class Resp:
+        def read(self):
+            return b""
+    urllib.request.urlopen = lambda req, timeout=None: (seen.append(dict(req.header_items())), Resp())[1]
+    try:
+        err = deliver("https://n.example/t", "takt h: a", "x", str(tok))
+        missing = deliver("https://n.example/t", "takt h: a", "x", str(d / "no-such-token"))
+    finally:
+        urllib.request.urlopen = real_open
+    ok(err is None and seen and seen[0].get("Authorization") == "Bearer tk_test123",
+       f"notify_token: sent as a bearer token: {seen}")
+    ok(isinstance(missing, str) and len(seen) == 1, "notify_token: a missing token file is a failed send, not a crash")
+    # takt update, against a copy of this file and a fake GitHub
+    me = Path(__file__).read_bytes()
+    spec.write_text('[job.a]\ncommand = ["true"]\n')
+    def copy(sub):
+        (d / sub).mkdir()
+        f = d / sub / "takt.py"
+        f.write_bytes(me)
+        return f
+    quiet = lambda *a: None
+    newer = me + b"\n# newer\n"
+    f = copy("git")
+    (d / "git" / ".git").mkdir()
+    ok(update(spec, fetch=lambda u: newer, script=f, say=quiet) == 0 and f.read_bytes() == me,
+       "update: a git checkout is left to git")
+    f = copy("same")
+    ok(update(spec, fetch=lambda u: me, script=f, say=quiet) == 0 and f.read_bytes() == me, "update: the same file is up to date")
+    f = copy("down")
+    def offline(u):
+        raise OSError("no network")
+    ok(update(spec, fetch=offline, script=f, say=quiet) == 1 and f.read_bytes() == me, "update: a failed fetch keeps the file")
+    f = copy("broken")
+    # no jobs file: only the start check stands between a broken download and the installed takt
+    ok(update(d / "no-such-jobs.toml", fetch=lambda u: b"raise SystemExit(3)\n", script=f, say=quiet) == 1
+       and f.read_bytes() == me, "update: a new file that does not start is not installed")
+    rejects = me.replace(b"def load_spec(path) -> dict:\n", b"def load_spec(path) -> dict:\n    raise ValueError('new code rejects this spec')\n", 1)
+    f = copy("rejects")
+    ok(update(spec, fetch=lambda u: rejects, script=f, say=quiet) == 1 and f.read_bytes() == me,
+       "update: a new file that cannot load this jobs file is not installed")
+    f = copy("good")
+    os.chmod(f, 0o755)
+    urls = []
+    ok(update(spec, "v9", fetch=lambda u: (urls.append(u), newer)[1], script=f, say=quiet) == 0 and f.read_bytes() == newer
+       and (os.name == "nt" or f.stat().st_mode & 0o777 == 0o755) and not list((d / "good").glob(".takt.*")),
+       "update: a good new file replaces the old one, keeps its mode, and leaves no temp file")
+    ok(urls == [UPDATE_URL.format(ref="v9")], f"update: the ref picks the URL: {urls}")
 
 
 def check_examples(ok, tmp):

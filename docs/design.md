@@ -116,7 +116,7 @@ Not measured yet: a week of real jobs under launchd, a sleep and wake under laun
 - The Windows installer writes paths under the user profile as `%USERPROFILE%` in `takt.cmd`. A Python path with non-ASCII characters outside the profile stops the installer with an error. No account with a non-ASCII name has been tested.
 - A failed step is recorded. takt does not retry it.
 - `status` shows only the jobs in the jobs file. For a read-only view of every scheduled job on a machine, use the tools of the OS.
-- Only `push` and `install` copy `takt.py` to a host, so a host can run an older version.
+- A host updates itself only from GitHub. Between two runs of `takt-update` (one hour), a host can run an older version. `takt update -A` updates every host now.
 - Windows tasks run only while the user is logged on.
 
 ## Not built
