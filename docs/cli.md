@@ -17,6 +17,7 @@ takt reads `~/.config/takt/jobs.toml` unless you give `--spec <file>` after the 
 | `takt start <id>` | Starts the job now, through the scheduler. The run records the trigger `start`, and `catch_up = "skip"` does not drop it. If the job is already running, also while it waits for a lock, takt says so and starts nothing. Needs `--allow-writes`. |
 | `takt web [--bind A] [--port N] [--allow-writes]` | Serves the dashboard on the Tailscale address of this device. `install` runs it as a service on the devices in `settings.web`. See [web.md](web.md). |
 | `takt report` | Sends the job rows of this device to the web devices now. Each run of a job also sends them. |
+| `takt update [-A] [--ref R]` | Installs the `takt.py` from GitHub (`settings.update_ref`, default `main`) when it differs. Before it replaces the file, the new file must start and must load this device's jobs file. A `takt.py` in a git checkout is left to git (`--force` replaces it). `-A` also updates every host. Each device also runs this every hour, see [Updates](jobs.md#updates). |
 | `takt enable <id>` | Arms the schedule of an installed job. Needs `--allow-writes`. |
 | `takt disable <id>` | Disarms the schedule. The job stays installed. Needs `--allow-writes`. |
 

@@ -20,6 +20,8 @@ irm https://raw.githubusercontent.com/damsleth/takt/main/install.ps1 | iex
 
 takt is one Python file with no dependencies. It needs Python 3.11 or later. The installer puts `takt.py` in `~/.local/share/takt/` and the `takt` command in `~/.local/bin/`.
 
+Each device updates itself every hour from the `main` branch (the `takt-update` job). To update now, run `takt update`, or `takt update -A` for every host. See [Updates](docs/jobs.md#updates).
+
 ## Start
 
 ```sh

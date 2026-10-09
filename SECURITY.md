@@ -19,6 +19,9 @@ Include the version (`takt --version`), the OS, and the steps that show the prob
 - **`takt web` is read-only by default.** The start, enable and disable buttons exist only when you start it with `--allow-writes` or set `web_writes = true`. Then anyone who can reach the page can start a job on any device in the net. The server checks the `Host` and `Origin` headers and needs a custom header on writes, so a web page in your browser cannot make those requests. This does not protect against another user on the tailnet.
 - **Devices report to the web device; the web device logs in nowhere.** Each device sends its own rows over HTTP to the web devices. The web device accepts a report only when `tailscale whois` names the sending machine as the device in the report, and that device is in the takt-net. A report holds rows only, so it cannot run anything. Only the optional start, enable and disable buttons for another device use ssh from the web device.
 
+- **`takt update` runs code from GitHub.** Each device fetches `takt.py` from the `main` branch of this repository every hour and runs it. Anyone who can push to `main` can run code on every device. takt checks only that the new file starts and loads your jobs file, not who wrote it. To pin a version, set `update_ref` to a tag. To stop it, set `update = false`.
+- **`notify_token` is a secret.** takt reads it from a file at each send and never writes it to a record, a log or a report. Keep the file readable only by you (`chmod 600`).
+
 ## The installers
 
 The installers download `takt.py` from the `main` branch of this repository. To install a fixed version, set `TAKT_REF` to a tag or a commit:

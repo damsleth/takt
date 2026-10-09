@@ -27,7 +27,7 @@ The host renders its own units with its own paths. The records and the scheduler
 
 The installers put `takt.py` in the same place as `push`. A host where you ran the installer and a host that you push to are the same. A push replaces the copy on the host with the copy on your machine.
 
-Only `push` and `install` copy files. Other commands run the copy that is on the host. After you upgrade takt on your machine, push again to keep the hosts current.
+Only `push` and `install` copy files. Other commands run the copy that is on the host. Each host also runs `takt-update` every hour, which installs the `takt.py` on GitHub `main` (see [Updates](jobs.md#updates)). To update every host now, run `takt update -A`.
 
 ## Argument rules
 
