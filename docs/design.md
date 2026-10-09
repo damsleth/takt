@@ -111,7 +111,7 @@ Not measured yet: a week of real jobs under launchd, a sleep and wake under laun
 ## Limits
 
 - A step without `timeout` that hangs holds its lock. Each job that waits for that lock ends as `lock-timeout`. Set `timeout` on a step that reads the network.
-- On Linux and macOS, a timeout ends the processes that the step started, found with `ps`. A process that starts between the `ps` and the kill continues to run. So does a child whose parent exited before the timeout: it is not in the tree. After a timeout, takt reads the rest of the output for at most 5 seconds and then closes the pipe, so such a child cannot hang the wrapper.
+- On Linux and macOS, a timeout ends the processes that the step started, found with `ps`. A process that starts between the `ps` and the kill continues to run. So does a child whose parent exited before the timeout: it is not in the tree. On Windows, a machine policy can refuse `taskkill` ("Access denied", seen on a domain-joined host). takt then ends the step through its own process handle, and a process that the step started can keep running. After a timeout, takt reads the rest of the output for at most 5 seconds and then closes the pipe, so such a child cannot hang the wrapper.
 - `--check` does not run the installers. They were tested by hand on macOS, Linux and Windows.
 - The Windows installer writes paths under the user profile as `%USERPROFILE%` in `takt.cmd`. A Python path with non-ASCII characters outside the profile stops the installer with an error. No account with a non-ASCII name has been tested.
 - A failed step is recorded. takt does not retry it.
