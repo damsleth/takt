@@ -1707,13 +1707,9 @@ def native_query(be, ids):
         return ["launchctl", "list"]
     if be == "systemd":
         return ["systemctl", "--user", "show", "-p", "Id,LoadState,ActiveState", *[f"takt-{j}.timer" for j in ids]]
-    # State is an enum name (Ready/Running/Disabled), not localized text like schtasks /Query.
-    # No \takt\ folder yet is an empty list (exit 0); any other error exits 1, so a strict
-    # inventory can tell "no tasks" from "could not ask".
-    return ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-            "try { Get-ScheduledTask -TaskPath '\\takt\\' -ErrorAction Stop | ForEach-Object { $_.TaskName + '|' + $_.State } } "
-            "catch { if ($_.FullyQualifiedErrorId -like 'CmdletizationQuery_NotFound*') { exit 0 }; "
-            "[Console]::Error.WriteLine($_); exit 1 }"]
+    # The XML of every task in the folder, in one call: not localized text, and no PowerShell or
+    # CIM (1 s to start, and 10 s to fail where CIM is refused). No \takt\ folder exits 1.
+    return ["schtasks", "/Query", "/TN", "\\takt\\", "/XML"]
 
 
 def parse_native(be, text, ids, agents_dir: Path):
@@ -1737,33 +1733,30 @@ def parse_native(be, text, ids, agents_dir: Path):
     return out
 
 
-def schtasks_text(run=subprocess.run):
-    """Task Scheduler without CIM. Some managed hosts refuse Get-ScheduledTask from any PowerShell
-    a process starts ("Cannot connect to CIM server. Access denied", kswon). The CSV list gives the
-    task names, and each task's XML gives <Settings><Enabled>; neither is localized text.
-    -> the same name|State lines as the PowerShell query, or None if schtasks cannot answer."""
-    kw = dict(capture_output=True, text=True, timeout=30, **NO_WINDOW)
-
-    def call(argv):  # an OSError or a timeout is "cannot answer", like a non-zero exit
-        try:
-            return run(argv, **kw)
-        except (OSError, subprocess.SubprocessError):
-            return subprocess.CompletedProcess(argv, 1, "", "")
-    r = call(["schtasks", "/Query", "/FO", "CSV", "/NH"])
-    if r.returncode:
+def schtasks_states(xml):
+    """`schtasks /Query /TN \\takt\\ /XML`: a <Tasks> root that holds each task's XML, each with
+    its own encoding declaration. -> name|State lines (the name from <URI>, Disabled when
+    <Settings><Enabled> is false), or None if the XML does not parse."""
+    try:  # an encoding declaration in a str is refused by the parser, so drop them all
+        root = ET.fromstring(re.sub(r"<\?xml[^>]*\?>", "", xml))
+    except (ET.ParseError, ValueError):
         return None
-    names = sorted({row[0][6:] for row in csv.reader(r.stdout.splitlines()) if row and row[0].lower().startswith("\\takt\\")})
     out = []
-    for n in names:
-        x = call(["schtasks", "/Query", "/TN", f"\\takt\\{n}", "/XML"])
-        if x.returncode:
-            return None
-        try:  # an encoding declaration in a str is refused by the parser, so drop it
-            en = ET.fromstring(re.sub(r"^\s*<\?xml[^>]*\?>", "", x.stdout)).find(f"{{{TS_NS}}}Settings/{{{TS_NS}}}Enabled")
-        except (ET.ParseError, ValueError):
-            return None
-        out.append(f"{n}|{'Disabled' if en is not None and (en.text or '').strip().lower() == 'false' else 'Ready'}")
+    for t in root.iter(f"{{{TS_NS}}}Task"):
+        name = (t.findtext(f"{{{TS_NS}}}RegistrationInfo/{{{TS_NS}}}URI") or "").strip().rpartition("\\")[2]
+        off = (t.findtext(f"{{{TS_NS}}}Settings/{{{TS_NS}}}Enabled") or "").strip().lower() == "false"
+        out.append(f"{name}|{'Disabled' if off else 'Ready'}")
     return "".join(f"{x}\n" for x in out)
+
+
+def no_takt_tasks(run=subprocess.run):
+    """The folder query failed: True only if the CSV list of all tasks (not localized) answers and
+    holds no \\takt\\ task, so a missing folder reads as "no tasks" and nothing else does."""
+    try:
+        r = run(["schtasks", "/Query", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=30, **NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and not any(row and row[0].lower().startswith("\\takt\\") for row in csv.reader(r.stdout.splitlines()))
 
 
 def native_text(be, ids, strict=False, run=subprocess.run):
@@ -1777,8 +1770,12 @@ def native_text(be, ids, strict=False, run=subprocess.run):
         if strict:
             raise RuntimeError(f"cannot read the scheduler ({q[0]}): {e}") from e
         return ""
-    if be == "schtasks" and r.returncode != 0 and (alt := schtasks_text(run)) is not None:
-        return alt
+    if be == "schtasks":
+        if r.returncode == 0 and (text := schtasks_states(r.stdout)) is not None:
+            return text
+        if r.returncode != 0 and no_takt_tasks(run):
+            return ""
+        r = subprocess.CompletedProcess(q, r.returncode or 1, "", r.stderr or "the task XML does not parse")
     if strict and r.returncode != 0:
         raise RuntimeError(f"cannot read the scheduler: {q[0]} exited {r.returncode}: {(r.stderr or '').strip()[:200]}")
     return r.stdout
@@ -3377,7 +3374,7 @@ def check_admin(ok, tmp):
     ok(parse_native("systemd", sd, ["a", "b", "c"], ad) == {"a": (True, True), "b": (True, False), "c": (False, False)},
        "native: systemctl show -> on, off, not installed")
     ok(parse_native("schtasks", "a|Ready\r\nb|Disabled\r\nother|Ready\r\n", ["a", "b", "c"], ad)
-       == {"a": (True, True), "b": (True, False)}, "native: Get-ScheduledTask states, foreign tasks ignored")
+       == {"a": (True, True), "b": (True, False)}, "native: schtasks states, foreign tasks ignored")
     (tmp / "la").mkdir()
     (tmp / "la" / f"{PREFIX}.a.plist").write_text("x")
     ok(parse_native("launchd", f"PID\tStatus\tLabel\n-\t0\t{PREFIX}.a\n", ["a", "b"], tmp / "la")
@@ -3666,29 +3663,31 @@ def check_review3(ok, tmp):
         except RuntimeError:
             ok(True, "")
     ok(native_text("schtasks", [], run=broken) == "", "status: a failed scheduler query still shows the table")
-    # kswon refuses Get-ScheduledTask (CIM access denied): schtasks' CSV list and XML stand in for it
-    xml = lambda on: (f'<?xml version="1.0" encoding="UTF-16"?>\n<Task xmlns="{TS_NS}"><Triggers><CalendarTrigger>'
-                      f'<Enabled>true</Enabled></CalendarTrigger></Triggers><Settings><Enabled>{on}</Enabled></Settings></Task>')
+    # one `schtasks /Query /TN \takt\ /XML` reads every task, in the shape Windows prints it
+    xml = lambda n, on: (f'\r\n<!-- \\takt\\{n} -->\r\n<?xml version="1.0" encoding="UTF-16"?>\r\n<Task xmlns="{TS_NS}">'
+                         f'<RegistrationInfo><URI>\\takt\\{n}</URI></RegistrationInfo><Triggers><CalendarTrigger>'
+                         f'<Enabled>true</Enabled></CalendarTrigger></Triggers><Settings>{on}</Settings></Task>')
+    dump = f'\r\n<Tasks>{xml("a", "")}{xml("b", "<Enabled>false</Enabled>")}\r\n</Tasks>\r\n'
 
-    def nocim(argv, **k):
-        if argv[0] == "powershell":
-            return subprocess.CompletedProcess(argv, 1, "", "Cannot connect to CIM server. Access denied")
-        if argv[1:3] == ["/Query", "/FO"]:
-            return subprocess.CompletedProcess(argv, 0, '"\\takt\\a","N/A","Ready"\n"\\takt\\a","N/A","Ready"\n'
-                                                       '"\\takt\\b","N/A","Disabled"\n"\\Other\\x","N/A","Ready"\n', "")
-        return subprocess.CompletedProcess(argv, 0, xml("false" if argv[3].endswith("\\b") else "true"), "")
-    text = native_text("schtasks", [], True, nocim)
+    def sched(folder, csv_rows=""):
+        def run(argv, **k):
+            if argv[2:4] == ["/TN", "\\takt\\"]:
+                return subprocess.CompletedProcess(argv, 0 if folder else 1, folder or "", "" if folder else "ERROR: not found")
+            return subprocess.CompletedProcess(argv, 0 if csv_rows is not None else 1, csv_rows or "", "")
+        return run
+    text = native_text("schtasks", [], True, sched(dump))
     ok(text == "a|Ready\nb|Disabled\n" and parse_native("schtasks", text, ["a", "b"], tmp) == {"a": (True, True), "b": (True, False)},
-       f"native: without CIM, schtasks lists the takt tasks and reads Settings/Enabled: {text!r}")
-    ok(inventory({"a": mkjob("a")}, "schtasks", tmp, nocim) is not None, "native: a plan reads the scheduler through the fallback")
-
-    def nocsv(argv, **k):
-        return subprocess.CompletedProcess(argv, 1, "", "denied")
-    try:
-        native_text("schtasks", [], True, nocsv)
-        ok(False, "native: a failed fallback must not read as no tasks")
-    except RuntimeError:
-        ok(True, "")
+       f"native: one schtasks XML dump gives each takt task and its Settings/Enabled: {text!r}")
+    ok(native_text("schtasks", [], True, sched(None, '"\\Other\\x","N/A","Ready"\n')) == "",
+       "native: no \\takt\\ folder, and the CSV list confirms it, is no tasks")
+    for why, run in (("the CSV list fails too", sched(None, None)),
+                     ("the CSV list holds takt tasks", sched(None, '"\\takt\\a","N/A","Ready"\n')),
+                     ("the XML does not parse", sched("<Tasks><Task"))):
+        try:
+            native_text("schtasks", [], True, run)
+            ok(False, f"native: a failed folder query must not read as no tasks when {why}")
+        except RuntimeError:
+            ok(True, "")
 
     # uninstall and retirement stop running work: the systemd service, the running Windows task
     nat = {"old": (True, True)}
