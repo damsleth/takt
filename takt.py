@@ -1841,9 +1841,11 @@ def status_rows(spec, state, nat, host="local", now=None):
     return rows
 
 
-def fmt_rows(rows):
-    """Fixed columns; HOST and ID first and space-free, so fzf's {1} {2} address a job."""
-    t = [("HOST", "ID", "SCHED", "STATUS", "LAST", "NEXT", "DETAIL")]
+def fmt_rows(rows, sort=None):
+    """Fixed columns; HOST and ID first and space-free, so fzf's {1} {2} address a job.
+    sort = (column, descending) marks that column's header with an arrow."""
+    t = [tuple(h + ("▼" if sort[1] else "▲") * (sort[0] == h.lower()) if sort else h
+               for h in ("HOST", "ID", "SCHED", "STATUS", "LAST", "NEXT", "DETAIL"))]
     hm = lambda s: s[5:16].replace("T", " ") if s else "-"
     t += [(r["host"], r["id"], r["sched"], r["status"], hm(r["last"]), hm(r["next"]), r["detail"]) for r in rows]
     w = [max(len(row[i]) for row in t) for i in range(6)]
@@ -2124,7 +2126,89 @@ def remote_rows(host, cfg=None, timeout=60, opts=()):
     return rows
 
 
-def ui(allow_writes):
+def status_all(a, be, adir, net, scope):
+    """The rows of `status`: this device's jobs, and with scope "net" every peer's too."""
+    spec = load_spec(a.spec) if Path(a.spec).exists() else {}  # a controller may only have hosts
+    rows = status_rows(spec, state_dir(a), native_states(spec, be, adir))
+    if scope == "net":
+        peers = [(h, c) for h, c in net["hosts"].items() if h != net["self"]]
+        with ThreadPoolExecutor() as ex:
+            rows += [x for rs in ex.map(lambda hc: remote_rows(*hc), peers) for x in rs]
+    return rows
+
+
+# The TUI opens in normal mode: these letters move, sort and quit. `f` shows the filter input and
+# unbinds them, so they type; enter or esc hides it and binds them again. The sort lives in the
+# list label, which fzf passes to `ui --key` and `ui --rows` as FZF_LIST_LABEL.
+UI_COLS = ("host", "id", "sched", "status", "last", "next")
+UI_LETTERS = "j,k,h,l,r,f,q"
+
+
+def ui_sort(label, key=None):
+    """The sort that the list label shows (" sort status ▲ ") -> (column, descending).
+    h and l move to the column on the left or right, r turns the direction."""
+    p = (label or "").split()
+    col, desc = (p[1], p[2] == "▼") if len(p) == 3 and p[1] in UI_COLS else ("host", False)
+    if key in ("h", "l"):
+        col = UI_COLS[(UI_COLS.index(col) + (1 if key == "l" else -1)) % len(UI_COLS)]
+    return col, desc != (key == "r")
+
+
+def ui_label(col, desc):
+    return f" sort {col} {'▼' if desc else '▲'} "
+
+
+def ui_cache(f):
+    """The rows of the last fetch, so the TUI shows them at once while it asks the hosts again."""
+    try:
+        return json.loads(f.read_text())
+    except (OSError, ValueError):
+        return {"at": None, "rows": []}
+
+
+def ui_lines(cache, col, desc, note=""):
+    """The table for fzf, sorted on col. A row with no value there (no next run) goes last."""
+    k = lambda r: (r[col] or "", r["host"], r["id"])
+    rows = sorted([r for r in cache["rows"] if r[col]], key=k, reverse=desc) + sorted([r for r in cache["rows"] if not r[col]], key=k)
+    lines = fmt_rows(rows, (col, desc))
+    lines[0] += f"  updated {cache['at']}{note}" if cache["at"] else "  loading"
+    return lines
+
+
+def ui_rows(a, fetch):
+    """`ui --rows fetch` asks every host, saves the rows and prints them; `--rows cache` prints the
+    saved rows. Both sort as the list label says."""
+    f = state_dir(a) / "ui.json"
+    if a.rows == "fetch":
+        cache = {"at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                 "rows": [{k: r.get(k) for k in (*UI_COLS, "detail")} for r in fetch()]}
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f"ui.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(cache), encoding="utf-8")
+        os.replace(tmp, f)  # a second TUI reads the old rows or the new ones, never half
+    else:
+        cache = ui_cache(f)
+    print("\n".join(ui_lines(cache, *ui_sort(os.environ.get("FZF_LIST_LABEL")))))
+    return 0
+
+
+def ui_key(me, env=os.environ):
+    """`ui --key`: fzf's transform for the keys whose action depends on the mode -> fzf actions."""
+    key = env.get("FZF_KEY", "")
+    # fzf drops a query change that a transform returns, so esc's binding clears the query itself
+    # after this runs. Filter mode: enter keeps the filter, esc drops it. Normal mode: esc drops
+    # the filter, or quits when there is none.
+    if env.get("FZF_INPUT_STATE") != "hidden":
+        return f"hide-input+rebind({UI_LETTERS})"
+    if key in ("h", "l", "r"):
+        return (f"change-list-label({ui_label(*ui_sort(env.get('FZF_LIST_LABEL'), key))})"
+                f"+reload-sync({me} ui --rows cache)")
+    if key == "esc":
+        return "" if env.get("FZF_QUERY") else "abort"
+    return f"execute({me} --host {{1}} show {{2}} | less -R)"
+
+
+def ui(a):
     """fzf over every host's status: preview = `show`, keys run the admin verbs on that host."""
     if not shutil.which("fzf"):
         sys.exit("takt ui needs fzf")
@@ -2133,20 +2217,23 @@ def ui(allow_writes):
         print(note)
         return 0
     me = shlex.quote(str(Path(__file__).resolve()))
-    ls = f"{me} status -A"
-    binds = [f"start:reload({ls})", f"ctrl-r:reload({ls})",
-             f"enter:execute({me} --host {{1}} show {{2}} | less -R)"]
-    keys = "enter details · ctrl-r refresh"
-    if allow_writes:
+    fetch = f"reload-sync({me} ui --rows fetch)"  # the cached rows stay on screen until it ends
+    # load, not start: a reload at start would cut off the cached rows on stdin before fzf reads them
+    binds = [f"load:unbind(load)+{fetch}", f"ctrl-r:{fetch}", "j:down", "k:up", "q:abort",
+             f"f:show-input+unbind({UI_LETTERS})", *[f"{k}:transform({me} ui --key)" for k in ("h", "l", "r", "enter")],
+             f"esc:transform({me} ui --key)+show-input+clear-query+hide-input"]
+    keys = "j/k move · h/l sort column · r reverse · f filter · enter details · ctrl-r refresh · q quit"
+    if a.allow_writes:
         for k, v in (("ctrl-s", "start"), ("ctrl-e", "enable"), ("ctrl-x", "disable")):
-            binds.append(f"{k}:transform-footer({me} --host {{1}} {v} {{2}} --allow-writes 2>&1 | tail -1)+reload({ls})")
-        keys += " · ctrl-s start · ctrl-e enable · ctrl-x disable"
+            binds.append(f"{k}:transform-footer({me} --host {{1}} {v} {{2}} --allow-writes 2>&1 | tail -1)+{fetch}")
+        keys += "\nctrl-s start · ctrl-e enable · ctrl-x disable"
     else:
-        keys += " · read-only (takt ui --allow-writes to act)"
-    r = subprocess.run(["fzf", "--header-lines=1", "--layout=reverse", "--no-sort", "--prompt", "takt> ",
-                        "--header", keys, "--footer", " ", "--preview", f"{me} --host {{1}} show {{2}}",
-                        "--preview-window", "down,55%,wrap", *[x for b in binds for x in ("--bind", b)]],
-                        stdin=subprocess.DEVNULL)
+        keys += "\nread-only (takt ui --allow-writes to act)"
+    lines = ui_lines(ui_cache(state_dir(a) / "ui.json"), "host", False, ", refreshing")
+    r = subprocess.run(["fzf", "--header-lines=1", "--layout=reverse", "--no-sort", "--no-input", "--prompt", "filter> ",
+                        "--list-label", ui_label("host", False), "--header", keys, "--footer", " ",
+                        "--preview", f"{me} --host {{1}} show {{2}}", "--preview-window", "down,55%,wrap",
+                        *[x for b in binds for x in ("--bind", b)]], input="\n".join(lines) + "\n", text=True)
     return 0 if r.returncode in (0, 1, 130) else r.returncode
 
 
@@ -2751,7 +2838,11 @@ def build_parser():
         v.add_argument("id")
         v.add_argument("--allow-writes", action="store_true")
     u = sub.add_parser("ui", help="fzf TUI over every host (also: bare `takt` on a terminal)")
+    # no --spec or --state: the commands fzf runs would not get them. TAKT_STATE reaches them all.
+    u.set_defaults(spec=str(CONFIG / "jobs.toml"), state=None)
     u.add_argument("--allow-writes", action="store_true", help="enable the start/enable/disable keys")
+    u.add_argument("--rows", choices=("fetch", "cache"), help=argparse.SUPPRESS)  # these two run inside fzf
+    u.add_argument("--key", action="store_true", help=argparse.SUPPRESS)
     rd = common(sub.add_parser("render", help="stage backend files"))
     rd.add_argument("--out", default="staging")
     rd.add_argument("--backend", choices=["launchd", "systemd", "schtasks", "all"], default="all")
@@ -2788,14 +2879,17 @@ def main(argv=None):
             return on_host(argv[1], argv[2:])
         argv = argv[2:]
     if not argv and sys.stdin.isatty() and sys.stdout.isatty():
-        return ui(False)
+        argv = ["ui"]
     ap = build_parser()
     a = ap.parse_args(argv)
 
     if a.check:
         return self_check()
-    if a.cmd == "ui":
-        return ui(a.allow_writes)
+    if a.cmd == "ui" and a.key:
+        print(ui_key(shlex.quote(str(Path(__file__).resolve()))))
+        return 0
+    if a.cmd == "ui" and not a.rows:
+        return ui(a)
     if a.cmd == "push":
         sys.exit("push needs a host: takt --host <host> push --allow-writes")
     if a.cmd == "init":
@@ -2846,6 +2940,11 @@ def main(argv=None):
         return code
     be = backend()
     adir = Path(getattr(a, "agents_dir", None) or default_dir(be, state_dir(a)))
+    if a.cmd == "ui":  # --rows, from inside fzf
+        def fetch():
+            net = net_settings()
+            return status_all(a, be, adir, net, status_scope(net, True)[0])
+        return ui_rows(a, fetch)
     if a.cmd == "status":
         net = net_settings()
         scope, note = status_scope(net, a.all_hosts, a.here)
@@ -2854,12 +2953,7 @@ def main(argv=None):
             if a.json:
                 print(note, file=sys.stderr)
             return 0
-        spec = load_spec(a.spec) if Path(a.spec).exists() else {}  # a controller may only have hosts
-        rows = status_rows(spec, state_dir(a), native_states(spec, be, adir))
-        if scope == "net":
-            peers = [(h, c) for h, c in net["hosts"].items() if h != net["self"]]
-            with ThreadPoolExecutor() as ex:
-                rows += [x for rs in ex.map(lambda hc: remote_rows(*hc), peers) for x in rs]
+        rows = status_all(a, be, adir, net, scope)
         if a.json:
             print(json.dumps(rows, indent=1))
         else:
@@ -3384,6 +3478,36 @@ def check_admin(ok, tmp):
     ok([(r["sched"], r["next"], r["status"]) for r in rows] == [("on", "2026-10-02T14:05", "never"), ("off", None, "never")],
        "status: next slot shown only while the scheduler is armed")
     ok(fmt_rows(rows)[1].split()[:2] == ["local", "a"], "status: host and id are fzf fields 1 and 2")
+    # TUI: the sort lives in the list label; h/l walk the columns and wrap, r turns the direction
+    ok(ui_sort(None) == ("host", False) and ui_sort(" sort bogus ▲ ") == ("host", False), "ui: no or bad label sorts on host")
+    ok([ui_sort(ui_label("next", True), k) for k in ("l", "h", "r")] == [("host", True), ("last", True), ("next", False)],
+       "ui: l and h wrap around the columns, r turns the direction")
+    rows += [{"host": "kvps", "id": "c", "sched": "on", "status": "ok", "last": None, "next": "2026-10-02T14:01", "detail": ""}]
+    for desc in (False, True):
+        t = ui_lines({"at": "10-02 14:03:10", "rows": rows}, "next", desc)
+        ok([x.split()[1] for x in t[1:]] == (["c", "a", "b"] if not desc else ["a", "c", "b"])
+           and ("NEXT▼" if desc else "NEXT▲") in t[0] and t[0].endswith("updated 10-02 14:03:10"),
+           f"ui: sort on next, {'descending' if desc else 'ascending'}; a job with no next run stays last: {t}")
+    ok(ui_lines({"at": None, "rows": []}, "host", False, ", refreshing")[0].endswith("  loading"), "ui: no cache yet says loading")
+    me = "/t/takt.py"
+    keys = lambda key, state="hidden", q="": ui_key(me, {"FZF_KEY": key, "FZF_INPUT_STATE": state, "FZF_QUERY": q,
+                                                       "FZF_LIST_LABEL": ui_label("host", False)})
+    ok(keys("enter", "enabled") == keys("esc", "enabled", "x") == f"hide-input+rebind({UI_LETTERS})",
+       "ui: enter and esc leave filter mode and bind the letters again")
+    ok(keys("l") == f"change-list-label({ui_label('id', False)})+reload-sync({me} ui --rows cache)",
+       "ui: l sorts on the next column from the cached rows, without asking the hosts")
+    ok(keys("esc", q="kw") == "" and keys("esc") == "abort", "ui: esc drops the filter first, then quits")
+    ok(keys("enter").startswith(f"execute({me} --host {{1}} show {{2}}"), "ui: enter opens the job")
+    import contextlib
+    import io
+    ua = argparse.Namespace(state=str(tmp / "uis"), rows="fetch")
+    for mode in ("fetch", "cache"):
+        ua.rows, out = mode, io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ui_rows(ua, lambda: [{**r, "record": {"big": "x"}} for r in rows])
+        ok([x.split()[1] for x in out.getvalue().splitlines()[1:]] == ["c", "a", "b"], f"ui: --rows {mode} prints the rows, on host")
+    saved = json.loads((tmp / "uis" / "ui.json").read_text())
+    ok(len(saved["rows"]) == 3 and "record" not in saved["rows"][0] and saved["at"], "ui: the cache keeps the table, not the records")
     # install and uninstall on systemd and schtasks, through an injected runner
     ctx, ud = {**CTX, "state": str(tmp / "ist")}, tmp / "units"
     acts = plan_install(spec, ctx, ud, "", "systemd")
