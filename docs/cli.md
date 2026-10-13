@@ -102,10 +102,19 @@ A line with an unescaped `%` is not imported, because cron sends the text after 
 
 The TUI is [fzf](https://github.com/junegunn/fzf) over `takt status -A`. The bottom pane shows `takt show` for the selected job.
 
+The TUI shows the rows of the last refresh at once, from `ui.json` in the state directory. It then asks every host again, and replaces the rows when all hosts answered. The header shows the time of the rows.
+
+The TUI starts in normal mode. In normal mode, letters are keys, not a filter.
+
 | Key | Action |
 |---|---|
-| Type | Filter the rows. |
+| `j` / `k` | Move down or up. |
+| `h` / `l` | Sort on the column on the left or on the right. The header marks the sort column with an arrow. |
+| `r` | Reverse the sort direction. |
+| `f` | Open the filter. Type to filter the rows. `enter` keeps the filter and goes back to normal mode. `esc` removes the filter and goes back to normal mode. |
 | `enter` | Open `takt show` in a pager. |
+| `esc` | Remove the filter. If there is no filter, quit. |
+| `q` | Quit. |
 | `ctrl-r` | Refresh. |
 | `ctrl-s` | Start the job. Only with `takt ui --allow-writes`. |
 | `ctrl-e` | Enable the job. Only with `takt ui --allow-writes`. |
@@ -135,6 +144,7 @@ Upgrade takt while no job runs. A wrapper that already runs keeps the version th
 | `~/.local/state/takt/log/` | The output of the wrapper under launchd. |
 | `~/.local/state/takt/retired/` | Plists that `install` took out of service. |
 | `~/.local/state/takt/crontab.bak` | The crontab before `install` changed it. |
+| `~/.local/state/takt/ui.json` | The rows of the last TUI refresh. The TUI shows them while it asks the hosts again. |
 
 ## Exit codes of `takt run`
 
