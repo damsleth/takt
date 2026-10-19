@@ -128,6 +128,8 @@ If the proxy trusts a real-IP header (for example from a CDN), make sure that it
 
 Reports do not go through the proxy. The devices send them to the address and port of `takt web`.
 
+The page allows same-origin scripts and styles and `https:` and `data:` images in its Content-Security-Policy. So the proxy can add a shared header bar: a script and a stylesheet that it serves on the same name, for example with nginx `sub_filter`. Inline script on the page is the page's own.
+
 ## Command
 
 ```sh
