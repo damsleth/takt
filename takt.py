@@ -2736,20 +2736,22 @@ WEB_HTML = r"""<!doctype html>
 @media(prefers-color-scheme:dark){:root{--bg:#14161a;--fg:#e6e8eb;--mut:#9aa1ab;--line:#2a2e35;--card:#1c1f25;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--acc:#60a5fa}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif}
 header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line)}
-h1{font-size:18px;margin:0}.mut{color:var(--mut)}main{padding:12px 16px}
+h1{font-size:18px;margin:0}.mut{color:var(--mut)}main{padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,38%);gap:16px;align-items:start}
+aside{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto}aside h2{margin-top:0}
+@media(max-width:900px){main{display:block}aside{position:static;max-height:none}}
 input[type=search]{padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
 .tw{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:640px}
 th,td{text-align:left;padding:5px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-td.d{white-space:normal;color:var(--mut);max-width:40ch}tbody tr{cursor:pointer}tbody tr:hover,tr.sel{background:var(--card)}
+td.d{white-space:normal;overflow-wrap:anywhere;color:var(--mut);max-width:40ch}tbody tr{cursor:pointer}tbody tr:hover,tr.sel{background:var(--card)}
 .ok{color:var(--ok)}.failed,.unreachable,.error,.lock-timeout{color:var(--bad)}.partial,.skipped{color:var(--warn)}.never{color:var(--mut)}
-pre{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;max-height:50vh;white-space:pre-wrap}
+pre{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px;overflow:auto;white-space:pre-wrap}
 button{padding:4px 12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
 button:hover{border-color:var(--acc)}#banner{color:var(--bad)}
 </style></head><body>
 <header><h1>takt</h1><span id="meta" class="mut"></span><input id="q" type="search" placeholder="filter">
 <label class="mut"><input id="auto" type="checkbox" checked> refresh every 15 s</label><button id="re">refresh</button><span id="banner"></span></header>
 <main><div class="tw"><table><thead><tr><th>HOST</th><th>ID</th><th>SCHED</th><th>STATUS</th><th>LAST</th><th>NEXT</th><th>DETAIL</th></tr></thead><tbody id="rows"></tbody></table></div>
-<h2 id="title" class="mut" style="font-size:15px">Select a job</h2><div id="acts"></div><span id="msg" class="mut"></span><pre id="show" hidden></pre></main>
+<aside><h2 id="title" class="mut" style="font-size:15px">Select a job</h2><div id="acts"></div><span id="msg" class="mut"></span><pre id="show" hidden></pre></aside></main>
 <script>
 const $=s=>document.querySelector(s);let data={rows:[],writes:false},sel=null,timer=null;
 const hm=s=>s?s.slice(5,16).replace('T',' '):'-';

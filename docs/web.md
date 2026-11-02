@@ -81,7 +81,7 @@ The web device keeps the last report of each device in `<state>/reports/<device>
 
 Use the Tailscale machine names of your devices as their names in takt (`jobs.<name>.toml`), so that the names in `tailscale whois` and in takt agree.
 
-The detail pane of a job on another device shows the reported record: status, steps, notes and preflight. The log tails stay on that device. Use `takt --host <name> show <id>` from the controller to see them.
+Click a row to open its detail pane on the right. On a screen narrower than 900 px, the pane is below the table. The detail pane of a job on another device shows the reported record: status, steps, notes and preflight. The log tails stay on that device. Use `takt --host <name> show <id>` from the controller to see them.
 
 The start, enable and disable buttons for another device still use ssh from the web device (see "Write buttons"). The page itself does not need ssh.
 
